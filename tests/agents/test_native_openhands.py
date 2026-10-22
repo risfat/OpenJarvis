@@ -8,7 +8,7 @@ from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.native_openhands import NativeOpenHandsAgent
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.registry import AgentRegistry
-from openjarvis.core.types import Conversation, Message, Role, ToolResult
+from openjarvis.core.types import Conversation, Message, Role, ToolCall, ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # ---------------------------------------------------------------------------
@@ -118,6 +118,51 @@ class TestNativeOpenHandsRegistration:
 
 
 class TestNativeOpenHandsAgent:
+    def test_truncate_handles_none_content_tool_call_turn(self):
+        """Tool-call assistant turns may carry content=None."""
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        agent = NativeOpenHandsAgent(engine, "test-model")
+        messages = [
+            Message(role=Role.USER, content="hi"),
+            Message(
+                role=Role.ASSISTANT,
+                content=None,  # type: ignore[arg-type]
+                tool_calls=[ToolCall(id="call_1", name="calculator", arguments="{}")],
+            ),
+        ]
+
+        assert agent._truncate_if_needed(messages) == messages
+
+    def test_native_tool_call_with_none_content_does_not_crash(self):
+        """Native tool-call responses may omit assistant text content."""
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.side_effect = [
+            _engine_response(
+                None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "name": "calculator",
+                        "arguments": '{"expression": "2+2"}',
+                    }
+                ],
+            ),
+            _engine_response("The result is 4."),
+        ]
+        agent = NativeOpenHandsAgent(
+            engine,
+            "test-model",
+            tools=[_CalculatorStub()],
+        )
+
+        result = agent.run("What is 2+2?")
+
+        assert result.content == "The result is 4."
+        assert result.turns == 2
+        assert [tr.content for tr in result.tool_results] == ["4"]
+
     def test_simple_response(self):
         """No code -> direct answer."""
         engine = MagicMock()
@@ -379,15 +424,22 @@ class TestNativeOpenHandsAgent:
         result = agent.run("")
         assert result.content == "Empty input received."
 
-    def test_error_400_handling(self):
-        """Agent catches 400 errors and returns friendly message."""
+    def test_error_400_propagation(self):
+        """Engine errors propagate so the eval runner records a real failure.
+
+        Updated from earlier behavior (which swallowed 4xx errors and
+        returned a "context too long" placeholder string) — see PR #303
+        for the design rationale: silent fakes were scoring 0 without
+        surfacing the underlying issue.
+        """
+        import pytest
+
         engine = MagicMock()
         engine.engine_id = "mock"
         engine.generate.side_effect = RuntimeError("HTTP 400 Bad Request")
         agent = NativeOpenHandsAgent(engine, "test-model")
-        result = agent.run("Hello")
-        assert "too long" in result.content
-        assert result.metadata.get("error") is True
+        with pytest.raises(RuntimeError, match="HTTP 400"):
+            agent.run("Hello")
 
     def test_xml_tool_call_extraction(self):
         """Agent parses XML-style tool calls."""
@@ -490,7 +542,8 @@ class TestTruncation:
 
 class TestUrlExpansion:
     def test_no_url_returns_false(self):
-        text, expanded = NativeOpenHandsAgent._expand_urls("What is 2+2?")
+        agent = NativeOpenHandsAgent(MagicMock(), "test-model")
+        text, expanded = agent._expand_urls("What is 2+2?")
         assert text == "What is 2+2?"
         assert expanded is False
 
@@ -501,11 +554,10 @@ class TestUrlExpansion:
         mock_resp.text = "<html><body>Page content</body></html>"
         mock_resp.headers = {"content-type": "text/html"}
         mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        monkeypatch.setattr(httpx.Client, "get", MagicMock(return_value=mock_resp))
 
-        text, expanded = NativeOpenHandsAgent._expand_urls(
-            "Summarize: https://example.com/article"
-        )
+        agent = NativeOpenHandsAgent(MagicMock(), "test-model")
+        text, expanded = agent._expand_urls("Summarize: https://example.com/article")
         assert expanded is True
         assert "Page content" in text
         assert "Content from" in text
@@ -514,14 +566,58 @@ class TestUrlExpansion:
         import httpx
 
         monkeypatch.setattr(
-            httpx,
+            httpx.Client,
             "get",
             MagicMock(side_effect=Exception("Connection error")),
         )
-        text, expanded = NativeOpenHandsAgent._expand_urls(
-            "Read https://example.com/broken"
-        )
+        agent = NativeOpenHandsAgent(MagicMock(), "test-model")
+        text, expanded = agent._expand_urls("Read https://example.com/broken")
         assert expanded is False
+
+    def test_url_prefetch_uses_network_policy_rate_and_runtime_identity(
+        self, monkeypatch
+    ):
+        import httpx
+
+        from openjarvis.core.events import EventBus, EventType
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        class _RecordingLimiter:
+            def __init__(self):
+                self.keys = []
+
+            def check(self, key):
+                self.keys.append(key)
+                return True, 0.0
+
+        fetch = MagicMock()
+        monkeypatch.setattr(httpx.Client, "get", fetch)
+        policy = CapabilityPolicy(default_deny=True)
+        policy.grant("_default", "network:fetch")
+        policy.deny("restricted-native", "network:fetch")
+        limiter = _RecordingLimiter()
+        bus = EventBus(record_history=True)
+        agent = NativeOpenHandsAgent(
+            MagicMock(),
+            "test-model",
+            bus=bus,
+            capability_policy=policy,
+            rate_limiter=limiter,
+            agent_id="restricted-native",
+        )
+
+        text, expanded = agent._expand_urls("Read https://example.com/private")
+
+        assert text == "Read https://example.com/private"
+        assert expanded is False
+        fetch.assert_not_called()
+        assert limiter.keys == ["restricted-native:web_search"]
+        assert any(
+            event.event_type == EventType.CAPABILITY_DENIED
+            and event.data["agent_id"] == "restricted-native"
+            and event.data["capability"] == "network:fetch"
+            for event in bus.history
+        )
 
     def test_url_expanded_uses_direct_path(self, monkeypatch):
         """When URL is expanded, agent bypasses tool loop."""
@@ -531,7 +627,7 @@ class TestUrlExpansion:
         mock_resp.text = "<html><body>Article text here</body></html>"
         mock_resp.headers = {"content-type": "text/html"}
         mock_resp.raise_for_status = MagicMock()
-        monkeypatch.setattr(httpx, "get", MagicMock(return_value=mock_resp))
+        monkeypatch.setattr(httpx.Client, "get", MagicMock(return_value=mock_resp))
 
         engine = MagicMock()
         engine.engine_id = "mock"

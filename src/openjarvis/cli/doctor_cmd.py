@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,15 @@ class CheckResult:
     status: str  # "ok", "warn", "fail"
     message: str
     details: Optional[str] = None
+
+
+@dataclass
+class _EngineProbe:
+    """One engine instance and the result of its single health probe."""
+
+    engine: Any | None
+    healthy: bool
+    error: str | None = None
 
 
 # -- Individual checks -------------------------------------------------------
@@ -79,28 +89,46 @@ def _get_config() -> Any:
         return JarvisConfig()
 
 
-def _check_engines() -> List[CheckResult]:
-    """Probe each registered engine for health."""
-    results: List[CheckResult] = []
-
+def _probe_engines(config: Any | None = None) -> Dict[str, _EngineProbe]:
+    """Instantiate and health-check every engine once, concurrently."""
     _ensure_engines_imported()
 
     from openjarvis.core.registry import EngineRegistry
     from openjarvis.engine import _discovery
 
-    config = _get_config()
+    resolved_config = config or _get_config()
+    keys = sorted(EngineRegistry.keys())
 
-    for key in sorted(EngineRegistry.keys()):
+    def probe(key: str) -> tuple[str, _EngineProbe]:
         try:
-            engine = _discovery._make_engine(key, config)
-            if engine.health():
-                results.append(CheckResult(f"Engine: {key}", "ok", "Reachable"))
-            else:
-                results.append(CheckResult(f"Engine: {key}", "warn", "Unreachable"))
+            engine = _discovery._make_engine(key, resolved_config)
+            return key, _EngineProbe(engine=engine, healthy=bool(engine.health()))
         except Exception as exc:
+            return key, _EngineProbe(engine=None, healthy=False, error=str(exc))
+
+    if not keys:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(keys)) as pool:
+        return dict(pool.map(probe, keys))
+
+
+def _check_engines(
+    probes: Optional[Dict[str, _EngineProbe]] = None,
+) -> List[CheckResult]:
+    """Probe each registered engine for health."""
+    results: List[CheckResult] = []
+
+    resolved_probes = probes if probes is not None else _probe_engines()
+
+    for key, probe in resolved_probes.items():
+        if probe.healthy:
+            results.append(CheckResult(f"Engine: {key}", "ok", "Reachable"))
+        elif probe.error:
             results.append(
-                CheckResult(f"Engine: {key}", "warn", f"Unreachable ({exc})")
+                CheckResult(f"Engine: {key}", "warn", f"Unreachable ({probe.error})")
             )
+        else:
+            results.append(CheckResult(f"Engine: {key}", "warn", "Unreachable"))
 
     if not results:
         results.append(CheckResult("Engines", "warn", "No engines registered"))
@@ -108,22 +136,18 @@ def _check_engines() -> List[CheckResult]:
     return results
 
 
-def _check_models() -> List[CheckResult]:
+def _check_models(
+    probes: Optional[Dict[str, _EngineProbe]] = None,
+) -> List[CheckResult]:
     """List models from healthy engines."""
     results: List[CheckResult] = []
 
-    _ensure_engines_imported()
+    resolved_probes = probes if probes is not None else _probe_engines()
 
-    from openjarvis.core.registry import EngineRegistry
-    from openjarvis.engine import _discovery
-
-    config = _get_config()
-
-    for key in sorted(EngineRegistry.keys()):
+    for key, probe in resolved_probes.items():
         try:
-            engine = _discovery._make_engine(key, config)
-            if engine.health():
-                models = engine.list_models()
+            if probe.healthy and probe.engine is not None:
+                models = probe.engine.list_models()
                 if models:
                     model_list = ", ".join(models[:5])
                     suffix = f" (+{len(models) - 5} more)" if len(models) > 5 else ""
@@ -149,7 +173,9 @@ def _check_models() -> List[CheckResult]:
     return results
 
 
-def _check_default_model() -> CheckResult:
+def _check_default_model(
+    probes: Optional[Dict[str, _EngineProbe]] = None,
+) -> CheckResult:
     """Check whether the configured default model is available."""
     try:
         config = load_config()
@@ -165,23 +191,22 @@ def _check_default_model() -> CheckResult:
             details="Router will select a model dynamically.",
         )
 
-    _ensure_engines_imported()
-
-    from openjarvis.core.registry import EngineRegistry
-    from openjarvis.engine import _discovery
+    from openjarvis.intelligence.model_catalog import resolve_model_id_for_engine
 
     preferred = config.intelligence.preferred_engine or config.engine.default
+    resolved_probes = probes if probes is not None else _probe_engines(config)
     check_order = []
     if preferred:
         check_order.append(preferred)
-    check_order += [k for k in sorted(EngineRegistry.keys()) if k != preferred]
+    check_order += [k for k in resolved_probes if k != preferred]
 
     for key in check_order:
         try:
-            engine = _discovery._make_engine(key, config)
-            if engine.health():
-                models = engine.list_models()
-                if default_model in models:
+            probe = resolved_probes.get(key)
+            if probe is not None and probe.healthy and probe.engine is not None:
+                models = probe.engine.list_models()
+                resolved_model = resolve_model_id_for_engine(default_model, key)
+                if resolved_model in models:
                     return CheckResult(
                         "Default model",
                         "ok",
@@ -206,7 +231,12 @@ def _check_optional_deps() -> List[CheckResult]:
         ("pynvml", "openjarvis[gpu-metrics]", "NVIDIA energy monitoring"),
         ("amdsmi", "openjarvis[energy-amd]", "AMD energy monitoring"),
         ("colbert", "openjarvis[memory-colbert]", "ColBERT memory backend"),
-        ("zeus", "openjarvis[energy-apple]", "Apple Silicon energy monitoring"),
+        (
+            "zeus_apple_silicon",
+            "openjarvis[energy-apple]",
+            "Apple Silicon energy monitoring",
+        ),
+        ("apple_fm_sdk", "openjarvis[afm]", "Apple Foundation Models (AFM 3)"),
     ]
     for pkg, install_hint, description in optional_packages:
         try:
@@ -221,6 +251,47 @@ def _check_optional_deps() -> List[CheckResult]:
                 )
             )
     return results
+
+
+def _check_speech_backend() -> CheckResult:
+    """Check whether the configured speech backend can load."""
+    try:
+        from openjarvis.speech._discovery import get_speech_backend
+
+        config = _get_config()
+        backend = get_speech_backend(config)
+        if backend is None:
+            return CheckResult(
+                "Speech backend",
+                "warn",
+                "Not configured",
+                details="Install desktop dependencies with `uv sync --extra desktop`.",
+            )
+
+        if backend.health():
+            return CheckResult(
+                "Speech backend",
+                "ok",
+                f"{backend.backend_id} ready",
+            )
+
+        details = None
+        last_error = getattr(backend, "last_error", None)
+        if callable(last_error):
+            details = last_error()
+        return CheckResult(
+            "Speech backend",
+            "warn",
+            f"{backend.backend_id} unavailable",
+            details=details
+            or "Install desktop dependencies with `uv sync --extra desktop`.",
+        )
+    except Exception as exc:
+        return CheckResult(
+            "Speech backend",
+            "warn",
+            f"Could not check: {exc}",
+        )
 
 
 def _check_security_profile() -> CheckResult:
@@ -302,10 +373,12 @@ def _run_all_checks() -> List[CheckResult]:
     checks.append(_check_python_version())
     checks.append(_check_config_exists())
     checks.append(_check_config_parses())
-    checks.extend(_check_engines())
-    checks.extend(_check_models())
-    checks.append(_check_default_model())
+    engine_probes = _probe_engines()
+    checks.extend(_check_engines(engine_probes))
+    checks.extend(_check_models(engine_probes))
+    checks.append(_check_default_model(engine_probes))
     checks.extend(_check_optional_deps())
+    checks.append(_check_speech_backend())
     checks.append(_check_nodejs())
     checks.append(_check_security_profile())
     return checks
@@ -351,3 +424,41 @@ def doctor(as_json: bool) -> None:
     console.print()
     console.print(f"  {ok_count} passed, {warn_count} warnings, {fail_count} failures")
     console.print()
+
+    # Background tasks section
+    from openjarvis.cli._bg_state import get_status
+    from openjarvis.core.paths import get_config_dir
+
+    scripts_dir = get_config_dir() / ".scripts"
+    console.print("[bold]Background tasks[/bold]")
+    bg = get_status()
+    bg_failed = False
+
+    if bg.rust_extension == "ready":
+        console.print("  [green]✓[/green] Rust extension: ready")
+    elif bg.rust_extension == "failed":
+        console.print(f"  [red]✗[/red] Rust extension: failed — {bg.rust_error[:80]}")
+        console.print(
+            f"    retry: {scripts_dir}/install-rust.sh && "
+            f"{scripts_dir}/build-extension.sh"
+        )
+        bg_failed = True
+    else:
+        console.print(
+            "  [yellow]…[/yellow] Rust extension: building (run in background)"
+        )
+
+    if not bg.models:
+        console.print("  [dim]no model downloads tracked[/dim]")
+    for model_id, state in bg.models.items():
+        if state == "ready":
+            console.print(f"  [green]✓[/green] {model_id}: ready")
+        elif state == "failed":
+            console.print(f"  [red]✗[/red] {model_id}: failed")
+            console.print(f"    retry: {scripts_dir}/pull-model.sh {model_id}")
+            bg_failed = True
+        else:
+            console.print(f"  [yellow]…[/yellow] {model_id}: downloading")
+
+    if bg_failed:
+        raise click.exceptions.Exit(code=1)

@@ -15,6 +15,7 @@ from typing import List
 
 import yaml
 
+from openjarvis.core.paths import get_config_dir
 from openjarvis.skills.sources.base import ResolvedSkill, SourceResolver
 
 LOGGER = logging.getLogger(__name__)
@@ -29,24 +30,14 @@ class OpenClawResolver(SourceResolver):
 
     def __init__(self, cache_root: Path | None = None) -> None:
         if cache_root is None:
-            cache_root = Path("~/.openjarvis/skill-cache/openclaw/").expanduser()
+            cache_root = get_config_dir() / "skill-cache" / "openclaw"
         self._cache_root = Path(cache_root)
 
     def cache_dir(self) -> Path:
         return self._cache_root
 
     def sync(self) -> None:
-        if self._cache_root.exists() and (self._cache_root / ".git").exists():
-            subprocess.run(
-                ["git", "-C", str(self._cache_root), "pull", "--ff-only"],
-                check=True,
-            )
-        else:
-            self._cache_root.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["git", "clone", OPENCLAW_REPO_URL, str(self._cache_root)],
-                check=True,
-            )
+        self._sync_git_cache(OPENCLAW_REPO_URL)
 
     def list_skills(self) -> List[ResolvedSkill]:
         skills_root = self._cache_root / "skills"

@@ -7,6 +7,11 @@ search:
 
 # Quick Start
 
+!!! tip "Running `jarvis` commands"
+    Every `jarvis ...` example below assumes you have either activated the project venv
+    (`source .venv/bin/activate`) or are prefixing each command with `uv run`. A bare
+    `jarvis init --preset ...` from a fresh clone will fail with `command not found`.
+
 ## What You Can Build
 
 OpenJarvis is a modular AI assistant framework. Here's what developers build with it:
@@ -14,7 +19,7 @@ OpenJarvis is a modular AI assistant framework. Here's what developers build wit
 === "Chat with Any Model"
 
     ```bash
-    jarvis ask "Explain quantum entanglement" -m qwen3:8b
+    jarvis ask "Explain quantum entanglement" -m qwen3.5:4b   # use qwen3.5:9b or larger on GPU
     ```
 
 === "Agent + Tools"
@@ -29,6 +34,13 @@ OpenJarvis is a modular AI assistant framework. Here's what developers build wit
     jarvis memory index ./docs/
     jarvis ask "How do I configure the engine?"
     ```
+
+    !!! warning "Requires the Rust extension"
+        `jarvis memory index` and `jarvis memory search` import `openjarvis_rust`. If you
+        skipped the `uv run maturin develop -m rust/crates/openjarvis-python/Cargo.toml`
+        step in [Installation](installation.md), these commands fail with
+        `ModuleNotFoundError: No module named 'openjarvis_rust'`. Build the extension
+        once and any preset (including `deep-research`) will work.
 
 === "5-Line Python SDK"
 
@@ -57,7 +69,7 @@ OpenJarvis is a modular AI assistant framework. Here's what developers build wit
 === "Deep Research"
 
     ```bash
-    jarvis init --preset deep-research
+    jarvis init --preset deep-research --force
     jarvis memory index ~/Documents/papers/
     jarvis ask "Summarize all documents about transformer architectures"
     # Multi-hop search across your indexed docs with citations
@@ -66,7 +78,7 @@ OpenJarvis is a modular AI assistant framework. Here's what developers build wit
 === "Code Assistant"
 
     ```bash
-    jarvis init --preset code-assistant
+    jarvis init --preset code-assistant --force
     jarvis ask "Write a Python script that parses CSV files"
     # Orchestrator agent with code execution, file I/O, and shell access
     ```
@@ -74,7 +86,7 @@ OpenJarvis is a modular AI assistant framework. Here's what developers build wit
 === "Scheduled Monitor"
 
     ```bash
-    jarvis init --preset scheduled-monitor
+    jarvis init --preset scheduled-monitor --force
     jarvis memory index ~/Documents/
     jarvis scheduler start
     jarvis scheduler create \
@@ -122,6 +134,48 @@ cd OpenJarvis
 
 This launches the backend API server and a React frontend at [http://localhost:5173](http://localhost:5173).
 You get a ChatGPT-like interface with streaming responses, tool use, energy monitoring, and a telemetry dashboard — all running locally on your hardware.
+
+Web search works with no configuration: queries go to the You.com keyless
+free tier, which is rate limited per IP and needs no signup. To raise those
+limits, or to use Tavily, Serply or Firecrawl instead, add `YOUDOTCOM_API_KEY`,
+`TAVILY_API_KEY`, `SERPLY_API_KEY` or `FIRECRAWL_API_KEY` under
+**Settings → Tools → Web Search** after the app starts, or export one before
+starting quickstart:
+
+```bash
+export YOUDOTCOM_API_KEY="..."   # free key: https://you.com/platform
+export SERPLY_API_KEY="..."      # free tier: https://serply.io
+export FIRECRAWL_API_KEY="..."   # free tier: https://www.firecrawl.dev/app/api-keys?utm_source=openjarvis&utm_medium=integration
+./scripts/quickstart.sh
+```
+
+Set `OPENJARVIS_WEB_SEARCH_ENGINE` to pick an engine explicitly — `youcom`,
+`tavily`, `serply`, `firecrawl`, or `duckduckgo`. The default, `auto`, uses
+Tavily when `TAVILY_API_KEY` is set, then You.com, then Serply, then Firecrawl,
+and settles on the You.com keyless tier when no key is set at all. DuckDuckGo
+remains the fallback for every engine; dropping to it is logged at `WARNING`,
+since its scraped results are unranked.
+
+Serply proxies Google itself, so Google search operators reach the index
+unchanged: `site:arxiv.org` restricts the corpus and `after:2026-01-01` bounds
+results by date, neither of which an AI-search index can honour. Set
+`SERPLY_PROXY_LOCATION` to a two-letter country code such as `DE` to ask for
+that country's result set instead of the default region. Keys and request
+options are documented at [serply.io](https://serply.io) and
+[serply.io/docs](https://serply.io/docs).
+
+Firecrawl also changes what happens when a query is a URL: instead of the local
+HTML strip, the page comes back as markdown, including JavaScript-rendered
+pages and PDFs. Set `FIRECRAWL_API_URL` to use a
+[self-hosted Firecrawl](https://docs.firecrawl.dev/contributing/self-host)
+instead of the hosted API; no key is needed if your instance runs without
+auth. Page fetches then run on your instance, and search queries go on to the
+search backend it is configured with. Keys:
+[firecrawl.dev](https://www.firecrawl.dev/app/api-keys?utm_source=openjarvis&utm_medium=integration).
+
+The script does not automatically source `.env` files. Run `source .env`
+first if that is where you keep the key. Stop any existing OpenJarvis server
+before restarting so it inherits the updated environment.
 
 To stop all services, press ++ctrl+c++ in the terminal.
 
@@ -247,7 +301,7 @@ Agents add multi-turn reasoning and tool-calling capabilities. The `orchestrator
 | `retrieval` | Search the memory store for relevant context. |
 | `llm` | Make sub-queries to another model. |
 | `file_read` | Read files with path validation. |
-| `web_search` | Web search via the Tavily API (requires `tools-search` extra). |
+| `web_search` | Web search via You.com (keyless by default), Tavily, Serply, or Firecrawl, with a DuckDuckGo fallback. |
 
 ### CLI Example
 

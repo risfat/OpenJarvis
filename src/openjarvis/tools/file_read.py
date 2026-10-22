@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
+from openjarvis.tools._paths import resolve_allowed_dirs
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 # Maximum file size to read (1 MB)
@@ -23,7 +24,9 @@ class FileReadTool(BaseTool):
         self,
         allowed_dirs: Optional[List[str]] = None,
     ) -> None:
-        self._allowed_dirs = [Path(d).resolve() for d in (allowed_dirs or [])]
+        self._allowed_dirs = [
+            Path(d).expanduser().resolve() for d in resolve_allowed_dirs(allowed_dirs)
+        ]
 
     @property
     def spec(self) -> ToolSpec:
@@ -53,8 +56,7 @@ class FileReadTool(BaseTool):
             return True
         resolved = path.resolve()
         return any(
-            resolved == d or str(resolved).startswith(str(d) + "/")
-            for d in self._allowed_dirs
+            resolved == d or resolved.is_relative_to(d) for d in self._allowed_dirs
         )
 
     def execute(self, **params: Any) -> ToolResult:
@@ -66,6 +68,9 @@ class FileReadTool(BaseTool):
                 success=False,
             )
         path = Path(file_path)
+        if not path.is_absolute() and self._allowed_dirs:
+            # A relative name means "inside the sandbox", not the process cwd.
+            path = self._allowed_dirs[0] / path
         # Block sensitive files (secrets, credentials, keys)
         from openjarvis.security.file_policy import is_sensitive_file
 

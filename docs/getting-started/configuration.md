@@ -17,6 +17,46 @@ The configuration file lives at:
 
 OpenJarvis creates the `~/.openjarvis/` directory and populates it with a default config when you run `jarvis init`.
 
+## Relocating the OpenJarvis directory
+
+OpenJarvis keeps **all** of its state — config, databases, caches, logs,
+credentials, skills, recipes, connectors — under a **single root** so it never
+clutters your home directory beyond one folder. By default that root is
+`~/.openjarvis`, but you can move it.
+
+The root is resolved in priority order:
+
+1. **`$OPENJARVIS_HOME`** — explicit override. Honored by both the installer
+   and the Python runtime.
+2. **`$XDG_DATA_HOME/openjarvis`** — used when `$XDG_DATA_HOME` is set (a single
+   `openjarvis` directory nested under it, per the XDG Base Directory spec).
+3. **`~/.openjarvis`** — the default. With no environment variables set, the
+   resolved path is exactly this, so existing installs are untouched.
+
+```bash
+# Relocate the whole install + runtime tree at install time:
+OPENJARVIS_HOME=~/apps/openjarvis curl -fsSL https://open-jarvis.github.io/OpenJarvis/install.sh | bash
+
+# Or for a single run / your shell profile:
+export OPENJARVIS_HOME=~/apps/openjarvis
+```
+
+Confirm where your data lives with:
+
+```bash
+jarvis config path
+```
+
+!!! note "Migration"
+    Because the default is unchanged, **no data migration is required** for
+    existing installs. If you set `OPENJARVIS_HOME` (or `XDG_DATA_HOME`) on a
+    machine that already has data in `~/.openjarvis`, OpenJarvis will look in
+    the new location and not see your old data — move it yourself if you want
+    to keep it: `mv ~/.openjarvis "$OPENJARVIS_HOME"`.
+
+`$OPENJARVIS_CONFIG` still points at an explicit `config.toml` file
+independently of the root, if you need to override just the config file path.
+
 ## Generating Configuration
 
 ### First-Time Setup
@@ -74,7 +114,7 @@ host = "http://localhost:30000"
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `default` | string | Auto-detected | Default engine backend. One of: `ollama`, `vllm`, `llamacpp`, `sglang`, `cloud`. Set automatically by `jarvis init` based on hardware detection. |
+| `default` | string | Auto-detected | Default engine backend. Registered keys include `ollama`, `vllm`, `sglang`, `llamacpp`, `mlx`, `lmstudio`, `exo`, `nexa`, `uzu`, `apple_fm`, `afm`, `lemonade`, `nim`, `cloud`, `litellm`, and `gemma_cpp`. Optional engines are available only when their dependencies are installed. |
 
 **`[engine.ollama]`:**
 
@@ -366,13 +406,43 @@ enabled = true
 
 ---
 
+### `[tools.weather]` — Native Weather Tool
+
+Controls defaults for the `get_weather` native tool. The requested location,
+unit system, and language remain overridable on every tool call.
+
+```toml
+[tools]
+enabled = "get_weather"
+
+[tools.weather]
+provider = "openweathermap"
+default_location = ""
+units = "metric"
+lang = "en"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `provider` | string | `"openweathermap"` | Weather provider; currently only OpenWeatherMap is supported. |
+| `default_location` | string | `""` | Optional fallback when a tool call omits its location. |
+| `units` | string | `"metric"` | Default unit system: `metric` or `imperial`. |
+| `lang` | string | `"en"` | Default OpenWeatherMap response language. |
+
+Keep the API key out of `config.toml`. Set `OPENWEATHERMAP_API_KEY`, save it
+through the tool credentials API/UI, or connect the Weather connector. The
+native tool reuses the connector's stored credential when no tool credential or
+environment variable is present.
+
+---
+
 ### `[server]` — API Server
 
 Controls the OpenAI-compatible API server started by `jarvis serve`.
 
 ```toml
 [server]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8000
 agent = "orchestrator"
 model = ""
@@ -381,7 +451,7 @@ workers = 1
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `host` | string | `"0.0.0.0"` | Bind address for the server. Use `"127.0.0.1"` to restrict to localhost. |
+| `host` | string | `"127.0.0.1"` | Bind address for the server. Configure API authentication before using `"0.0.0.0"` for LAN access. |
 | `port` | int | `8000` | Port number for the server. |
 | `agent` | string | `"orchestrator"` | Agent to use for chat completion requests. |
 | `model` | string | `""` | Default model for the server. When empty, uses `intelligence.default_model` or the first available model. |
@@ -394,6 +464,23 @@ jarvis serve --host 127.0.0.1 --port 9000 --model qwen3:8b --agent simple
 ```
 
 ---
+
+### `[analytics]` — Optional External Usage Analytics
+
+External analytics default to off. Interactive Bash installation and `jarvis
+init` ask whether to share: **Press Enter or Y to consent, or N to decline**.
+Unattended runs do not consent automatically; `--analytics` explicitly enables
+sharing and `--no-analytics` declines it.
+
+```toml
+[analytics]
+enabled = false
+```
+
+Use `jarvis config set analytics.enabled true` to enable sharing or `false` to
+disable it, then restart the server and reload the frontend. This setting is
+independent of local telemetry and leaderboard participation. See
+[Telemetry](../telemetry.md) for the event catalog and sharing details.
 
 ### `[telemetry]` — Telemetry Persistence
 
@@ -564,7 +651,7 @@ enforce_tool_confirmation = true
 | `scan_output` | bool | `true` | Whether to scan model output. |
 | `secret_scanner` | bool | `true` | Enable secret detection (API keys, tokens, passwords). |
 | `pii_scanner` | bool | `true` | Enable PII detection (emails, SSNs, credit cards). |
-| `enforce_tool_confirmation` | bool | `true` | Require confirmation before executing tools. |
+| `enforce_tool_confirmation` | bool | `true` | Accepted but **not currently enforced**. Whether you get prompts depends on the entry point. See [System Access](../user-guide/system-access.md#confirmation-behaviour). |
 
 !!! tip "Choosing a security mode"
     Use `"warn"` during development to see what would be flagged without disrupting output.
@@ -634,20 +721,23 @@ graph TD
     A[detect_hardware] --> B{GPU detected?}
     B -->|No| C[llamacpp]
     B -->|Yes| D{GPU vendor?}
-    D -->|Apple| E[ollama]
+    D -->|Apple| E[mlx]
     D -->|NVIDIA| F{Datacenter GPU?}
-    D -->|AMD| G[vllm]
+    D -->|AMD| G{Datacenter GPU?}
     F -->|Yes: A100, H100, H200, L40, A10, A30| H[vllm]
     F -->|No: consumer GPU| I[ollama]
+    G -->|Yes: MI300, MI325, MI350, MI355| J[vllm]
+    G -->|No: consumer GPU| K[lemonade]
 ```
 
 | Hardware | Recommended Engine | Reason |
 |----------|--------------------|--------|
 | No GPU | `llamacpp` | Efficient CPU inference with GGUF quantized models |
-| Apple Silicon | `ollama` | Native Metal acceleration, easy model management |
+| Apple Silicon | `mlx` | Native inference through the MLX framework |
 | NVIDIA consumer GPU (RTX 3090, 4090, etc.) | `ollama` | Simple setup, good performance for single-user |
 | NVIDIA datacenter GPU (A100, H100, H200, L40, A10, A30) | `vllm` | High-throughput batched serving, continuous batching |
-| AMD GPU | `vllm` | ROCm support via vLLM |
+| AMD consumer GPU | `lemonade` | Optimized support for AMD GPUs and Ryzen AI NPUs |
+| AMD datacenter GPU (MI300, MI325, MI350, MI355) | `vllm` | High-throughput serving on supported datacenter accelerators |
 
 ---
 
@@ -655,19 +745,25 @@ graph TD
 
 ### Apple Silicon Mac
 
+Start an MLX server with the same model ID used in the configuration:
+
+```bash
+jarvis host mlx-community/Qwen2.5-7B-4bit --backend mlx --port 8080
+```
+
 ```toml
 # ~/.openjarvis/config.toml
 # Apple Silicon MacBook Pro (M3 Max, 128 GB unified memory)
 
 [engine]
-default = "ollama"
+default = "mlx"
 
-[engine.ollama]
-host = "http://localhost:11434"
+[engine.mlx]
+host = "http://localhost:8080"
 
 [intelligence]
-default_model = "qwen3:8b"
-fallback_model = "llama3.2:3b"
+default_model = "mlx-community/Qwen2.5-7B-4bit"
+fallback_model = ""
 temperature = 0.7
 max_tokens = 1024
 
@@ -1047,8 +1143,19 @@ OpenJarvis respects the following environment variables:
 | `OPENAI_API_KEY` | API key for OpenAI cloud inference. Required for the `cloud` engine with OpenAI models. |
 | `ANTHROPIC_API_KEY` | API key for Anthropic cloud inference. Required for the `cloud` engine with Claude models. |
 | `GOOGLE_API_KEY` | API key for Google Gemini inference. Required for the `google` engine. |
-| `MINIMAX_API_KEY` | API key for MiniMax cloud inference. Required for the `cloud` engine with MiniMax models (MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.5, MiniMax-M2.5-highspeed). |
-| `TAVILY_API_KEY` | API key for the Tavily web search tool. Required for the `web_search` tool. |
+| `MINIMAX_API_KEY` | API key for MiniMax cloud inference. Required for the `cloud` engine with MiniMax models (MiniMax-M3, MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.5, MiniMax-M2.5-highspeed). |
+| `ATLASCLOUD_API_KEY` | API key for [Atlas Cloud](https://www.atlascloud.ai) inference. Required for the `cloud` engine with `atlascloud/`-prefixed models (e.g. `atlascloud/openai/gpt-4.1-mini`, `atlascloud/deepseek-ai/deepseek-v3.2`). Atlas Cloud is an OpenAI-compatible aggregator — `GET https://api.atlascloud.ai/v1/models` lists every routable ID. |
+| `TAVILY_API_KEY` | API key for the Tavily web search engine. Optional — when set, `auto` engine selection prefers Tavily. |
+| `YOUDOTCOM_API_KEY` | API key for the You.com web search engine. Optional — raises the keyless free-tier limits and enables You.com Contents extraction for URL queries. |
+| `SERPLY_API_KEY` | API key for the Serply web search engine, which proxies Google. Optional. When set and no other search key is, `auto` engine selection prefers Serply over the keyless tier. Keys: [serply.io](https://serply.io). |
+| `SERPLY_PROXY_LOCATION` | Two-letter country code asking Serply for that country's Google result set, for example `DE`. Optional. Unset means the API answers from its own default region. See [serply.io/docs](https://serply.io/docs). |
+| `FXMACRODATA_API_KEY` | API key for the `fx_macro_data` tool. Optional: recent USD releases, the USD release calendar and every currency's indicator catalogue work without it. The key unlocks other currencies, full history and FX rates. Keys: [fxmacrodata.com](https://fxmacrodata.com/subscribe). |
+| `FIRECRAWL_API_KEY` | API key for the Firecrawl web search engine. Optional. When set and no other search key is, `auto` engine selection prefers Firecrawl over the keyless tier, and URL queries return the page or PDF as markdown. Keys: [firecrawl.dev](https://www.firecrawl.dev/app/api-keys?utm_source=openjarvis&utm_medium=integration). |
+| `FIRECRAWL_API_URL` | Base URL of the Firecrawl API, for example a [self-hosted Firecrawl](https://docs.firecrawl.dev/contributing/self-host). Optional. Defaults to `https://api.firecrawl.dev`. Any other URL enables the Firecrawl engine without a key, for instances that run without auth. |
+| `OPENJARVIS_WEB_SEARCH_ENGINE` | Web search engine for the `web_search` tool: `auto` (default), `youcom`, `tavily`, `serply`, `firecrawl`, or `duckduckgo`. |
+
+In the desktop app, you can save `ATLASCLOUD_API_KEY` in **Cloud Models** or
+**Settings → API Keys** instead of setting an environment variable.
 
 ## Next Steps
 
@@ -1057,3 +1164,59 @@ OpenJarvis respects the following environment variables:
 - [Architecture Overview](../architecture/overview.md) — Understand how the pieces fit together
 - [Intelligence Primitive](../architecture/intelligence.md) — Model identity and generation defaults
 - [Learning & Traces](../architecture/learning.md) — Router policies and the trace-driven feedback loop
+
+---
+
+## Learning & spec search
+
+LLM-guided spec search uses a frontier model to automatically improve your local agent configuration. See the [user guide](../user-guide/llm-guided-spec-search.md) for a full walkthrough.
+
+### `[learning.spec_search]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Gate the entire spec-search subsystem |
+| `autonomy_mode` | string | `"tiered"` | `auto`, `tiered`, or `manual` |
+| `teacher_model` | string | `"claude-opus-4-6"` | Frontier model for diagnosis and planning |
+| `max_cost_per_session_usd` | float | `5.0` | Per-session teacher API budget |
+| `max_tool_calls_per_diagnosis` | int | `30` | Max teacher tool calls in diagnosis phase |
+
+### `[learning.spec_search.triggers]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `scheduled_enabled` | bool | `true` | Enable daily scheduled sessions |
+| `scheduled_cron` | string | `"0 3 * * *"` | Cron expression for scheduled trigger |
+| `scheduled_min_new_traces` | int | `20` | Minimum new traces to trigger |
+| `cluster_enabled` | bool | `true` | Enable failure cluster trigger |
+| `cluster_check_interval_minutes` | int | `60` | How often to check for clusters |
+| `cluster_min_size` | int | `5` | Minimum traces in a cluster |
+| `cluster_failure_threshold` | float | `0.3` | Feedback <= this counts as failure |
+
+### `[learning.spec_search.gate]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `min_improvement` | float | `0.0` | Minimum overall score improvement to accept |
+| `max_regression` | float | `0.05` | Maximum per-cluster score drop before rejecting |
+| `benchmark_subsample_size` | int | `50` | Tasks per gate run |
+| `full_benchmark` | bool | `false` | Disable subsampling (slower, more accurate) |
+
+### `[learning.spec_search.benchmark]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `synthesis_feedback_threshold` | float | `0.7` | Min feedback for benchmark traces |
+| `max_benchmark_size` | int | `200` | Max tasks in the benchmark |
+| `auto_refresh` | bool | `true` | Auto-mine new high-feedback traces |
+| `max_synthesis_cost_usd_per_refresh` | float | `2.0` | Cost cap per benchmark refresh |
+
+### `[learning.spec_search.tier_overrides]`
+
+Override the default risk tier for any operation. Keys are operation names, values are tier strings (`auto`, `review`, `manual`).
+
+```toml
+[learning.spec_search.tier_overrides]
+# patch_system_prompt = "auto"     # promote to auto after trust
+# replace_system_prompt = "auto"
+```

@@ -135,28 +135,55 @@ class TestBrowserNavigateTool:
         assert result.success is False
         assert "SSRF blocked" in result.content
 
-    def test_execute_ssrf_module_missing(self):
-        """When ssrf module is not available, skip check and proceed."""
+    def test_execute_ssrf_check_is_not_bypassable(self):
+        """The SSRF check must never be silently skipped (#225/#467).
+
+        Previously browser navigation wrapped the SSRF check in
+        ``except ImportError: pass``, so an environment where the check
+        couldn't be imported silently disabled SSRF protection. ``check_ssrf``
+        now has a pure-Python fallback and is always reachable, so the import
+        no longer fails — and the guard must not be bypassed. Here a real
+        blocked URL is rejected even though navigation would otherwise
+        succeed, proving the check runs unconditionally.
+        """
         from openjarvis.tools.browser import BrowserNavigateTool
 
+        mock_ssrf_module = MagicMock()
+        mock_ssrf_module.check_ssrf.return_value = (
+            "URL resolves to private IP: 127.0.0.1"
+        )
         page = _make_mock_page()
         session = _make_mock_session(page)
 
-        # Make the ssrf import fail inside execute
-        import builtins
+        with patch("openjarvis.tools.browser._session", session):
+            with patch.dict(
+                "sys.modules",
+                {"openjarvis.security.ssrf": mock_ssrf_module},
+            ):
+                tool = BrowserNavigateTool()
+                result = tool.execute(url="http://127.0.0.1:8080/admin")
 
-        original_import = builtins.__import__
+        # Blocked — the check ran and was honored, not skipped.
+        assert result.success is False
+        assert "SSRF blocked" in result.content
 
-        def _mock_import(name, *args, **kwargs):
-            if name == "openjarvis.security.ssrf":
-                raise ImportError("No module named 'openjarvis.security.ssrf'")
-            return original_import(name, *args, **kwargs)
+    def test_execute_allows_public_url(self):
+        """The always-on SSRF check must not break legitimate navigation."""
+        from openjarvis.tools.browser import BrowserNavigateTool
+
+        mock_ssrf_module = MagicMock()
+        mock_ssrf_module.check_ssrf.return_value = None  # public URL, allowed
+        page = _make_mock_page()
+        session = _make_mock_session(page)
 
         with patch("openjarvis.tools.browser._session", session):
-            with patch.object(builtins, "__import__", side_effect=_mock_import):
+            with patch.dict(
+                "sys.modules",
+                {"openjarvis.security.ssrf": mock_ssrf_module},
+            ):
                 tool = BrowserNavigateTool()
                 result = tool.execute(url="https://example.com")
-        # Should succeed since SSRF check is skipped
+
         assert result.success is True
 
     def test_execute_success(self):
@@ -225,7 +252,10 @@ class TestBrowserNavigateTool:
         page.goto.side_effect = Exception("net::ERR_NAME_NOT_RESOLVED")
         session = _make_mock_session(page)
 
-        with patch("openjarvis.tools.browser._session", session):
+        with (
+            patch("openjarvis.security.ssrf.check_ssrf", return_value=None),
+            patch("openjarvis.tools.browser._session", session),
+        ):
             tool = BrowserNavigateTool()
             result = tool.execute(url="https://nonexistent.example")
 
@@ -255,12 +285,20 @@ class TestBrowserClickTool:
         assert tool.spec.name == "browser_click"
         assert tool.spec.category == "browser"
 
-    def test_spec_requires_selector(self):
+    def test_spec_advertises_selector_and_aliases(self):
         from openjarvis.tools.browser import BrowserClickTool
 
         tool = BrowserClickTool()
-        assert "selector" in tool.spec.parameters["properties"]
-        assert "selector" in tool.spec.parameters["required"]
+        properties = tool.spec.parameters["properties"]
+        assert {"selector", "target", "text", "element", "query"} <= set(properties)
+        assert "required" not in tool.spec.parameters
+        assert tool.spec.parameters["anyOf"] == [
+            {"required": ["selector"]},
+            {"required": ["target"]},
+            {"required": ["text"]},
+            {"required": ["element"]},
+            {"required": ["query"]},
+        ]
 
     def test_spec_has_by_text_parameter(self):
         from openjarvis.tools.browser import BrowserClickTool
@@ -290,6 +328,141 @@ class TestBrowserClickTool:
         assert result.success is False
         assert "No selector" in result.content
 
+    def test_resolver_skips_hidden_duplicate_match(self):
+        from openjarvis.tools.browser import BrowserClickTool
+
+        class Match:
+            def __init__(self, *, visible=True, enabled=True):
+                self.visible = visible
+                self.enabled = enabled
+                self.clicked = False
+
+            def is_visible(self):
+                return self.visible
+
+            def is_enabled(self):
+                return self.enabled
+
+            def click(self, **_kwargs):
+                self.clicked = True
+
+        class Locator:
+            def __init__(self, matches):
+                self.matches = matches
+
+            def count(self):
+                return len(self.matches)
+
+            def nth(self, index):
+                return self.matches[index]
+
+        hidden = Match(visible=False)
+        visible = Match()
+        empty = Locator([])
+        duplicate = Locator([hidden, visible])
+        frame = MagicMock(url="https://example.com")
+        frame.locator.return_value = duplicate
+        frame.get_by_text.return_value = empty
+        frame.get_by_role.return_value = empty
+        page = MagicMock(frames=[frame])
+
+        strategy = BrowserClickTool()._resolve_and_click(page, ".save", False)
+
+        assert strategy == "css"
+        assert hidden.clicked is False
+        assert visible.clicked is True
+
+    def test_resolver_applies_ordinal_after_actionability_filter(self):
+        from openjarvis.tools.browser import BrowserClickTool
+
+        class Match:
+            def __init__(self, *, visible=True):
+                self.visible = visible
+                self.clicked = False
+
+            def is_visible(self):
+                return self.visible
+
+            def is_enabled(self):
+                return True
+
+            def click(self, **_kwargs):
+                self.clicked = True
+
+        class Locator:
+            def __init__(self, matches):
+                self.matches = matches
+
+            def count(self):
+                return len(self.matches)
+
+            def nth(self, index):
+                return self.matches[index]
+
+        hidden = Match(visible=False)
+        first_visible = Match()
+        second_visible = Match()
+        duplicate = Locator([hidden, first_visible, second_visible])
+        empty = Locator([])
+        frame = MagicMock(url="https://example.com")
+        frame.get_by_text.return_value = duplicate
+        frame.get_by_role.return_value = empty
+        page = MagicMock(frames=[frame])
+
+        strategy = BrowserClickTool()._resolve_and_click(page, "first save", True)
+
+        assert strategy == "text-exact"
+        assert hidden.clicked is False
+        assert first_visible.clicked is True
+        assert second_visible.clicked is False
+
+    def test_resolver_clicks_fourth_actionable_role_match(self):
+        from openjarvis.tools.browser import BrowserClickTool
+
+        class Match:
+            def __init__(self):
+                self.clicked = False
+
+            def is_visible(self):
+                return True
+
+            def is_enabled(self):
+                return True
+
+            def click(self, **_kwargs):
+                self.clicked = True
+
+        class Locator:
+            def __init__(self, matches=()):
+                self.matches = list(matches)
+
+            def count(self):
+                return len(self.matches)
+
+            def nth(self, index):
+                return self.matches[index]
+
+        buttons = [Match() for _ in range(4)]
+        empty = Locator()
+        frame = MagicMock(url="https://example.com")
+        frame.get_by_text.return_value = empty
+        frame.get_by_role.side_effect = lambda role, name: (
+            Locator(buttons) if role == "button" and name.search("Save") else empty
+        )
+        page = MagicMock(frames=[frame])
+
+        strategy = BrowserClickTool()._resolve_and_click(
+            page, "fourth save button", True
+        )
+
+        assert strategy == "role-button"
+        assert [match.clicked for match in buttons] == [False, False, False, True]
+
+    def test_every_supported_ordinal_is_a_description_stopword(self):
+        from openjarvis.tools.browser import BrowserClickTool
+
+        assert set(BrowserClickTool._ORDINALS) <= BrowserClickTool._DESC_STOPWORDS
+
     def test_execute_playwright_not_installed(self):
         from openjarvis.tools.browser import BrowserClickTool
 
@@ -304,6 +477,14 @@ class TestBrowserClickTool:
         from openjarvis.tools.browser import BrowserClickTool
 
         page = _make_mock_page()
+        page.frames = [page]
+        match = MagicMock()
+        match.is_visible.return_value = True
+        match.is_enabled.return_value = True
+        page.locator.return_value.count.return_value = 1
+        page.locator.return_value.nth.return_value = match
+        page.get_by_text.return_value.count.return_value = 0
+        page.get_by_role.return_value.count.return_value = 0
         session = _make_mock_session(page)
 
         with patch("openjarvis.tools.browser._session", session):
@@ -312,7 +493,7 @@ class TestBrowserClickTool:
 
         assert result.success is True
         assert "Clicked element" in result.content
-        page.click.assert_called_once_with("#submit-btn")
+        match.click.assert_called_once_with(timeout=8000)
         assert result.metadata["selector"] == "#submit-btn"
         assert result.metadata["by_text"] is False
 
@@ -320,6 +501,12 @@ class TestBrowserClickTool:
         from openjarvis.tools.browser import BrowserClickTool
 
         page = _make_mock_page()
+        page.frames = [page]
+        match = MagicMock()
+        match.is_visible.return_value = True
+        match.is_enabled.return_value = True
+        page.get_by_text.return_value.count.return_value = 1
+        page.get_by_text.return_value.nth.return_value = match
         session = _make_mock_session(page)
 
         with patch("openjarvis.tools.browser._session", session):
@@ -327,15 +514,23 @@ class TestBrowserClickTool:
             result = tool.execute(selector="Sign In", by_text=True)
 
         assert result.success is True
-        page.get_by_text.assert_called_once_with("Sign In")
-        page.get_by_text.return_value.click.assert_called_once()
+        assert page.get_by_text.call_count >= 1
+        match.click.assert_called_once_with(timeout=8000)
         assert result.metadata["by_text"] is True
 
     def test_execute_click_error(self):
         from openjarvis.tools.browser import BrowserClickTool
 
         page = _make_mock_page()
-        page.click.side_effect = Exception("Element not found")
+        page.frames = [page]
+        match = MagicMock()
+        match.is_visible.return_value = True
+        match.is_enabled.return_value = True
+        match.click.side_effect = Exception("Element not found")
+        page.locator.return_value.count.return_value = 1
+        page.locator.return_value.nth.return_value = match
+        page.get_by_text.return_value.count.return_value = 0
+        page.get_by_role.return_value.count.return_value = 0
         session = _make_mock_session(page)
 
         with patch("openjarvis.tools.browser._session", session):

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from dataclasses import fields
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,6 +13,86 @@ from openjarvis.system import JarvisSystem, SystemBuilder
 
 
 class TestJarvisSystem:
+    def test_new_fields_do_not_shift_existing_positional_arguments(self):
+        """Adding mcp_tools must not reinterpret legacy positional calls."""
+        config = JarvisConfig()
+        bus = EventBus()
+        engine = MagicMock()
+        agent = MagicMock()
+        tools = [MagicMock()]
+        tool_executor = MagicMock()
+        memory_backend = MagicMock()
+
+        system = JarvisSystem(
+            config,
+            bus,
+            engine,
+            "mock",
+            "test-model",
+            agent,
+            "simple",
+            tools,
+            tool_executor,
+            memory_backend,
+        )
+
+        assert system.tools is tools
+        assert system.tool_executor is tool_executor
+        assert system.memory_backend is memory_backend
+        assert system.mcp_tools == []
+
+    def test_rate_limiter_is_after_all_preexisting_positional_fields(self):
+        field_names = [field.name for field in fields(JarvisSystem)]
+        assert field_names[-2:] == ["mcp_tools", "rate_limiter"]
+
+        legacy_values = [object() for _ in field_names[:-1]]
+        system = JarvisSystem(*legacy_values)
+
+        assert system.mcp_tools is legacy_values[-1]
+        assert system.rate_limiter is None
+
+    def test_system_orchestrator_wires_direct_agent_security(self):
+        from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
+        from openjarvis.core.registry import AgentRegistry
+        from openjarvis.security.capabilities import CapabilityPolicy
+
+        class _Limiter:
+            def __init__(self):
+                self.keys = []
+
+            def check(self, key):
+                self.keys.append(key)
+                return True, 0.0
+
+        class _DirectAgent(BaseAgent):
+            agent_id = "system-direct"
+            required_capabilities = ("code:execute",)
+
+            def run(self, input, context: AgentContext | None = None, **kwargs):
+                return self._execution_denied_result() or AgentResult(content="ran")
+
+        AgentRegistry.register_value("system-direct", _DirectAgent)
+        policy = CapabilityPolicy(default_deny=True)
+        policy.grant("_default", "code:execute")
+        policy.deny("system-direct", "code:execute")
+        limiter = _Limiter()
+        config = JarvisConfig()
+        config.agent.context_from_memory = False
+        system = JarvisSystem(
+            config=config,
+            bus=EventBus(record_history=True),
+            engine=MagicMock(),
+            engine_key="mock",
+            model="test-model",
+            capability_policy=policy,
+            rate_limiter=limiter,
+        )
+
+        result = system.ask("run", agent="system-direct")
+
+        assert "code:execute" in result["content"]
+        assert limiter.keys == ["system-direct:agent_run"]
+
     def test_ask_direct_mode(self):
         engine = MagicMock()
         engine.generate.return_value = {
@@ -325,6 +406,85 @@ class TestSystemBuilder:
         assert builder._sandbox is True
         assert builder._scheduler is True
         assert builder._engine_key == "ollama"
+
+
+class TestSystemBuilderEngineInstance:
+    """Explicit engine injection (jarvis eval --base-url path)."""
+
+    @staticmethod
+    def _fake_engine(healthy: bool = True) -> MagicMock:
+        engine = MagicMock(
+            spec=["health", "can_serve", "generate", "list_models", "close"]
+        )
+        engine.health.return_value = healthy
+        engine._host = "http://127.0.0.1:18999"
+        return engine
+
+    def test_engine_instance_is_fluent(self):
+        builder = SystemBuilder(JarvisConfig())
+        engine = self._fake_engine()
+        result = builder.engine_instance(engine, key="my-endpoint")
+        assert result is builder
+        assert builder._engine_instance is engine
+        assert builder._engine_instance_key == "my-endpoint"
+
+    def test_resolve_engine_returns_injected_instance(self):
+        config = JarvisConfig()
+        engine = self._fake_engine(healthy=True)
+        builder = SystemBuilder(config).engine_instance(engine, key="endpoint")
+        resolved_engine, resolved_key = builder._resolve_engine(config)
+        assert resolved_engine is engine
+        assert resolved_key == "endpoint"
+
+    def test_unhealthy_injected_instance_raises_naming_host(self):
+        config = JarvisConfig()
+        engine = self._fake_engine(healthy=False)
+        builder = SystemBuilder(config).engine_instance(engine, key="endpoint")
+        with pytest.raises(RuntimeError, match=r"http://127\.0\.0\.1:18999"):
+            builder._resolve_engine(config)
+
+    def test_unhealthy_injected_instance_never_consults_discovery(self):
+        """The observed failure mode: an explicit endpoint must NOT be
+        silently replaced by whatever other engine discovery finds."""
+        config = JarvisConfig()
+        engine = self._fake_engine(healthy=False)
+        builder = SystemBuilder(config).engine_instance(engine)
+        with patch("openjarvis.engine._discovery.get_engine") as mock_get_engine:
+            with pytest.raises(RuntimeError, match="Refusing to fall back"):
+                builder._resolve_engine(config)
+        mock_get_engine.assert_not_called()
+
+    def test_healthy_injected_instance_never_consults_discovery(self):
+        config = JarvisConfig()
+        engine = self._fake_engine(healthy=True)
+        builder = SystemBuilder(config).engine_instance(engine, key="endpoint")
+        with patch("openjarvis.engine._discovery.get_engine") as mock_get_engine:
+            resolved_engine, _ = builder._resolve_engine(config)
+        assert resolved_engine is engine
+        mock_get_engine.assert_not_called()
+
+    def test_build_wires_injected_engine(self):
+        """build() must use the injected engine (possibly behind security
+        wrappers) instead of running discovery."""
+        config = JarvisConfig()
+        engine = self._fake_engine(healthy=True)
+        engine.list_models.return_value = ["stub-model"]
+        builder = (
+            SystemBuilder(config)
+            .engine_instance(engine, key="endpoint")
+            .model("stub-model")
+            .telemetry(False)
+            .traces(False)
+        )
+        system = builder.build()
+        try:
+            inner = system.engine
+            while hasattr(inner, "_engine"):
+                inner = inner._engine
+            assert inner is engine
+            assert system.engine_key == "endpoint"
+        finally:
+            system.close()
 
 
 class TestJarvisSystemClose:

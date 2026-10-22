@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from openjarvis.skills.importer import SkillImporter
 from openjarvis.skills.parser import SkillParser
 from openjarvis.skills.sources.base import ResolvedSkill
@@ -165,6 +167,53 @@ class TestImportSkill:
         assert (target / "references" / "REFERENCE.md").exists()
         assert (target / "assets" / "template.txt").exists()
 
+    @pytest.mark.parametrize(
+        ("subdir", "with_scripts"),
+        [("references", False), ("scripts", True)],
+    )
+    def test_rejects_symlinks_before_copying_external_targets(
+        self, tmp_path: Path, subdir: str, with_scripts: bool
+    ):
+        target_root = tmp_path / "skills"
+        src_dir = tmp_path / "source" / "my-skill"
+        src_dir.mkdir(parents=True)
+        (src_dir / "SKILL.md").write_text(
+            "---\nname: my-skill\ndescription: A test skill\n---\n"
+        )
+
+        outside = tmp_path / "outside.txt"
+        outside.write_text("SENSITIVE-SENTINEL")
+        copied_root = src_dir / subdir
+        copied_root.mkdir()
+        try:
+            (copied_root / "linked.txt").symlink_to(outside)
+        except OSError:
+            pytest.skip("filesystem does not permit creating symlinks")
+
+        resolved = ResolvedSkill(
+            name="my-skill",
+            source="hermes",
+            path=src_dir,
+            category="x",
+            description="A test skill",
+            commit="a",
+        )
+        importer = SkillImporter(
+            parser=SkillParser(),
+            tool_translator=ToolTranslator(),
+            target_root=target_root,
+        )
+        target = target_root / "hermes" / "my-skill"
+        target.mkdir(parents=True)
+        (target / "keep.txt").write_text("existing install")
+
+        result = importer.import_skill(resolved, with_scripts=with_scripts, force=True)
+
+        assert not result.success
+        assert any("symlink" in warning.lower() for warning in result.warnings)
+        assert (target / "keep.txt").read_text() == "existing install"
+        assert not (target / subdir / "linked.txt").exists()
+
     def test_force_overwrites_existing_install(self, tmp_path: Path):
         target_root = tmp_path / "skills"
         importer = SkillImporter(
@@ -202,3 +251,71 @@ class TestImportSkill:
 
         installed = target_root / "hermes" / "my-skill" / "SKILL.md"
         assert "Original" in installed.read_text()
+
+
+class TestDangerousCapabilityGate:
+    def _make_importer(self, tmp_path: Path) -> SkillImporter:
+        return SkillImporter(
+            parser=SkillParser(),
+            tool_translator=ToolTranslator(),
+            target_root=tmp_path / "skills",
+        )
+
+    def _make_resolved_with_caps(
+        self, tmp_path: Path, caps: list[str]
+    ) -> ResolvedSkill:
+        src_dir = tmp_path / "source" / "my-skill"
+        src_dir.mkdir(parents=True)
+        caps_yaml = "".join(f"  - {c}\n" for c in caps)
+        (src_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: my-skill\n"
+            "description: A test skill\n"
+            f"required_capabilities:\n{caps_yaml}"
+            "---\n"
+            "Body"
+        )
+        return ResolvedSkill(
+            name="my-skill",
+            source="hermes",
+            path=src_dir,
+            category="testing",
+            description="A test skill",
+            commit="abc123",
+        )
+
+    def test_refuses_unreviewed_dangerous_skill(self, tmp_path: Path):
+        importer = self._make_importer(tmp_path)
+        resolved = self._make_resolved_with_caps(tmp_path, ["shell:execute"])
+        result = importer.import_skill(resolved)
+
+        assert not result.success
+        assert result.requires_confirmation
+        assert result.dangerous_capabilities == ["shell:execute"]
+        assert any("dangerous" in w.lower() for w in result.warnings)
+        # Nothing may be written to disk on refusal
+        assert not (tmp_path / "skills" / "hermes" / "my-skill").exists()
+
+    def test_confirm_dangerous_installs_and_records_tier(self, tmp_path: Path):
+        importer = self._make_importer(tmp_path)
+        resolved = self._make_resolved_with_caps(tmp_path, ["shell:execute"])
+        result = importer.import_skill(resolved, confirm_dangerous=True)
+
+        assert result.success
+        assert result.requires_confirmation
+        assert any("confirmed by caller" in w for w in result.warnings)
+        content = (tmp_path / "skills" / "hermes" / "my-skill" / ".source").read_text()
+        assert 'trust_tier = "unreviewed"' in content
+        assert 'dangerous_capabilities = ["shell:execute"]' in content
+
+    def test_benign_capabilities_need_no_confirmation(self, tmp_path: Path):
+        importer = self._make_importer(tmp_path)
+        resolved = self._make_resolved_with_caps(tmp_path, ["network:fetch"])
+        result = importer.import_skill(resolved)
+
+        assert result.success
+        assert not result.requires_confirmation
+        assert result.dangerous_capabilities == []
+        content = (tmp_path / "skills" / "hermes" / "my-skill" / ".source").read_text()
+        assert 'trust_tier = "unreviewed"' in content
+        assert "dangerous_capabilities = []" in content

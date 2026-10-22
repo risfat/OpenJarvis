@@ -36,6 +36,19 @@ class EvalResult:
     ttft: float = 0.0
     energy_joules: float = 0.0
     power_watts: float = 0.0
+    # Per-rail breakdown. Without these a reader cannot tell which hardware
+    # actually did the work -- and on Apple Silicon that is the whole point:
+    # an ANE-resident model draws almost nothing on the GPU rail.
+    cpu_energy_joules: float = 0.0
+    gpu_energy_joules: float = 0.0
+    dram_energy_joules: float = 0.0
+    ane_energy_joules: float = 0.0
+    soc_energy_joules: float = 0.0
+    # Which rail set energy_joules was taken from ("soc" / "gpu"), and how it
+    # was obtained. Without energy_method a modelled estimate is
+    # indistinguishable from a hardware measurement at read time.
+    energy_basis: str = ""
+    energy_method: str = ""
     gpu_utilization_pct: float = 0.0
     throughput_tok_per_sec: float = 0.0
     mfu_pct: float = 0.0
@@ -49,6 +62,11 @@ class EvalResult:
     trace_steps: int = 0
     trace_energy_joules: float = 0.0
     trace_data: Optional[Dict[str, Any]] = None
+    # Spec §6.2 extended fields for cross-framework comparison
+    framework: str = "openjarvis"
+    framework_commit: str = ""
+    tool_calls: int = 0
+    turn_count: int = 0
 
 
 @dataclass(slots=True)
@@ -89,6 +107,23 @@ class RunConfig:
     # running thinking/reasoning models that consume turns on intermediate
     # reasoning before producing tool calls.
     max_turns: Optional[int] = None
+    # Spec §6.2: backend-external endpoint config (for hermes/openclaw)
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    # Filter dataset records by id. When set, only records whose record_id
+    # appears in this list are processed. Used for surgical re-runs of
+    # specific records (e.g. recovering silent-fake records without
+    # re-running the entire benchmark).
+    record_ids: Optional[List[str]] = None
+    # terminal-bench harness budgets (terminalbench-native backend).
+    # global_agent_timeout_sec bounds each trial's agent phase — SETUP+RUN
+    # together, since terminal-bench runs installed-agent setup inside the
+    # agent budget with an infinite tmux timeout. When set it REPLACES the
+    # per-task max_agent_timeout_sec; 0 disables the bound (per-task budgets
+    # apply); None uses the backend default (1800 s).
+    global_agent_timeout_sec: Optional[float] = None
+    # Scales per-task budgets when global_agent_timeout_sec is not set.
+    global_timeout_multiplier: Optional[float] = None
 
 
 @dataclass(slots=True)
@@ -152,6 +187,14 @@ class RunSummary:
     efficiency: Optional[Dict[str, Any]] = None
     normalized_statistics: Optional[Dict[str, Any]] = None
     normalized_efficiency: Optional[Dict[str, Any]] = None
+    # Continuous-score reporting (added alongside binary accuracy so frontier
+    # models do not saturate the metric on rubric-judge benchmarks).
+    mean_continuous_score: Optional[float] = None
+    median_continuous_score: Optional[float] = None
+    pct_above_0_5: Optional[float] = None
+    pct_above_0_7: Optional[float] = None
+    pct_above_0_8: Optional[float] = None
+    pct_above_0_9: Optional[float] = None
     # Internal fields set by the runner after construction
     _output_path: Optional[Path] = None
     _traces_dir: Optional[Path] = None
@@ -211,6 +254,9 @@ class ExecutionConfig:
     # to JarvisConfig.agent.max_turns (default 10). Bump to 30-50 for
     # thinking/reasoning models on agentic benchmarks (GAIA, LiveResearch).
     max_turns: Optional[int] = None
+    # terminal-bench harness budgets (see RunConfig for semantics).
+    global_agent_timeout_sec: Optional[float] = None
+    global_timeout_multiplier: Optional[float] = None
 
 
 @dataclass(slots=True)
@@ -243,6 +289,11 @@ class BenchmarkConfig:
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     subset: Optional[str] = None
+    record_ids: Optional[List[str]] = None
+    # Per-benchmark override of the terminal-bench harness budgets
+    # (see RunConfig for semantics).
+    global_agent_timeout_sec: Optional[float] = None
+    global_timeout_multiplier: Optional[float] = None
 
 
 @dataclass(slots=True)
@@ -255,6 +306,10 @@ class EvalSuiteConfig:
     run: ExecutionConfig = field(default_factory=ExecutionConfig)
     models: List[ModelConfig] = field(default_factory=list)
     benchmarks: List[BenchmarkConfig] = field(default_factory=list)
+    # Spec §6.2: optional [backend.external] section for hermes/openclaw
+    # backends. Holds the OpenAI-compatible endpoint config.
+    backend_external_base_url: Optional[str] = None
+    backend_external_api_key: Optional[str] = None
 
 
 __all__ = [

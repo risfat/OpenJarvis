@@ -14,6 +14,7 @@ from typing import List
 
 import yaml
 
+from openjarvis.core.paths import get_config_dir
 from openjarvis.skills.sources.base import ResolvedSkill, SourceResolver
 
 LOGGER = logging.getLogger(__name__)
@@ -28,25 +29,14 @@ class HermesResolver(SourceResolver):
 
     def __init__(self, cache_root: Path | None = None) -> None:
         if cache_root is None:
-            cache_root = Path("~/.openjarvis/skill-cache/hermes/").expanduser()
+            cache_root = get_config_dir() / "skill-cache" / "hermes"
         self._cache_root = Path(cache_root)
 
     def cache_dir(self) -> Path:
         return self._cache_root
 
     def sync(self) -> None:
-        """Clone or pull the Hermes repo into the cache directory."""
-        if self._cache_root.exists() and (self._cache_root / ".git").exists():
-            subprocess.run(
-                ["git", "-C", str(self._cache_root), "pull", "--ff-only"],
-                check=True,
-            )
-        else:
-            self._cache_root.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                ["git", "clone", HERMES_REPO_URL, str(self._cache_root)],
-                check=True,
-            )
+        self._sync_git_cache(HERMES_REPO_URL)
 
     def list_skills(self) -> List[ResolvedSkill]:
         """Walk skills/<category>/<skill>/SKILL.md."""

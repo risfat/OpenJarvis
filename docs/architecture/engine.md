@@ -116,15 +116,16 @@ All providers produce the same output format consumed by agents:
 | **LM Studio** | `lmstudio` | OpenAI-compatible | 1234 | No (GPU optional) | Desktop GUI, easy model management |
 | **Exo** | `exo` | OpenAI-compatible | 52415 | No (distributed) | Distributed inference across heterogeneous devices |
 | **Nexa** | `nexa` | OpenAI-compatible | 18181 | No (CPU/GPU) | On-device inference with GGUF models |
-| **Lemonade** | `lemonade` | OpenAI-compatible | 8000 | AMD GPU/NPU | AMD consumer GPUs (RDNA), Ryzen AI NPUs |
+| **Lemonade** | `lemonade` | OpenAI-compatible | 13305 | AMD GPU/NPU | AMD consumer GPUs (RDNA), Ryzen AI NPUs |
 | **Uzu** | `uzu` | OpenAI-compatible | 8000 | Varies | Uzu inference runtime |
-| **Apple FM** | `apple_fm` | OpenAI-compatible | 8079 | Apple Silicon | Apple Foundation Model on-device inference |
+| **Apple FM (shim)** | `apple_fm` | OpenAI-compatible | 8079 | Apple Silicon | Apple Foundation Models over HTTP, for external OpenAI clients |
+| **Apple FM (in-process)** | `afm` | Python SDK (in-process) | — | Apple Silicon | Apple Foundation Models with no HTTP hop — the preferred path |
 | **LiteLLM** | `litellm` | OpenAI-compatible | — | No | Unified proxy to 100+ LLM providers |
 | **Cloud** | `cloud` | Provider SDKs | — | No | OpenAI, Anthropic, Google API access |
 
 ### Ollama
 
-The Ollama backend communicates via Ollama's native HTTP API at `/api/chat` and `/api/tags`. It is the default engine on Apple Silicon and consumer NVIDIA GPUs.
+The Ollama backend communicates via Ollama's native HTTP API at `/api/chat` and `/api/tags`. It is the recommended engine for consumer NVIDIA GPUs.
 
 - **Default host:** `http://localhost:11434`
 - **Health check:** `GET /api/tags`
@@ -135,7 +136,7 @@ The Ollama backend communicates via Ollama's native HTTP API at `/api/chat` and 
 
 The vLLM backend uses the OpenAI-compatible `/v1/chat/completions` API. It is recommended for datacenter GPUs (NVIDIA A100, H100, L40, A10, A30 and AMD MI300, MI325, MI350, MI355).
 
-- **Default host:** `http://localhost:8000`
+- **Default host:** `http://localhost:13305`
 - **Health check:** `GET /v1/models`
 - **Tool fallback:** If the server returns HTTP 400 when tools are included, the engine automatically retries without tools
 
@@ -204,7 +205,7 @@ The Nexa backend connects to the Nexa SDK on-device inference server via a FastA
 
 The Lemonade backend connects to the [Lemonade](https://lemonade-server.ai/) inference server, which is optimized for AMD consumer GPUs (RDNA architecture) and Ryzen AI Neural Processing Units (NPUs). It uses the OpenAI-compatible `/v1/chat/completions` API.
 
-- **Default host:** `http://localhost:8000`
+- **Default host:** `http://localhost:13305`
 - **Health check:** `GET /v1/models`
 - **Install:** Visit [lemonade-server.ai](https://lemonade-server.ai/) for platform-specific installation instructions
 - **Best for:** Ryzen AI GPUs and NPUs, and AMD-based desktop and laptop systems
@@ -218,17 +219,42 @@ The Uzu backend connects to the Uzu inference runtime. Unlike other OpenAI-compa
 - **Health check:** `GET /models`
 - **Best for:** Uzu-optimized inference workloads
 
-### Apple FM
+### Apple Foundation Models (AFM 3)
 
-The Apple FM backend connects to Apple's Foundation Model SDK via a FastAPI shim (`apple_fm_shim.py`). It wraps `python-apple-fm-sdk` as an OpenAI-compatible API. Requires macOS 15+ with Apple Silicon.
+Two backends serve the same on-device model. Both require an Apple Silicon Mac on **macOS 26+** with Apple Intelligence enabled.
 
-!!! note "Token counts"
-    The Apple FM SDK does not expose token counts. The shim returns 0 for all token counts. Benchmark throughput and energy-per-token metrics will reflect this limitation.
+**`afm` — in-process (preferred).** Drives `apple_fm_sdk` directly, with no HTTP hop and no second process. Prefer it for anything energy-measured: a separate uvicorn process burns CPU inside the same measurement window.
 
-- **Default host:** `http://localhost:8079`
-- **Health check:** `GET /v1/models`
-- **Install:** `pip install python-apple-fm-sdk`
-- **Best for:** Running Apple Foundation Models natively on Apple Silicon hardware
+**`apple_fm` — OpenAI-compatible shim.** A FastAPI server (`apple_fm_shim.py`) on port 8079, for pointing external OpenAI clients at AFM.
+
+**Install.** The SDK compiles Swift bindings at install time, so a full Xcode is required — Command Line Tools alone fail:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+    uv sync --extra afm
+```
+
+`>=0.2.1` is the floor: that release added `SystemLanguageModel.token_count` and `.context_size`, which both backends use for token accounting.
+
+```bash
+jarvis ask --engine afm --model afm-3-core "..."   # in-process
+jarvis host afm-3 --backend apple_fm               # launch the shim
+```
+
+- **Model labels:** `afm-3`, `afm-3-core`, `afm-3-core-advanced`
+- **Context length:** 4096 tokens
+- **Configuration:** `[engine.afm]` — `instructions`, `use_case`, `guardrails`, `sampling`
+
+!!! warning "The model label does not select the model"
+    The SDK exposes no variant selector. The Foundation Models framework's dynamic profile picks AFM 3 Core (dense ~3B) or AFM 3 Core Advanced (20B sparse MoE, 1–4B active per request) based on the host device. The label only tags the run. `AppleFMEngine.describe()` records the SDK version, context size and host chip so a run can be attributed after the fact.
+
+!!! warning "Latency figures are not comparable to other backends"
+    `stream_response` yields cumulative text snapshots batching roughly 8–10 tokens each, not individual tokens. `ttft` is therefore time-to-first-*chunk* — around 450 ms on an M1 Pro, versus a few tens of ms of real first-token latency — and derived inter-token latencies are inter-*chunk* latencies. Token counts, throughput and per-token energy are unaffected.
+
+!!! note "Energy"
+    AFM runs predominantly on the Neural Engine, so its energy is invisible on a GPU-only rail. Install `openjarvis[energy-apple]` to measure CPU/GPU/DRAM/ANE separately; records are then written with `energy_basis = "soc"` and an `ane_energy_joules` column. Without it, no Apple energy is recorded at all.
+
+There is no Private Cloud Compute path in the Python SDK — inference is always on-device, which is what makes the energy measurement meaningful.
 
 ### LiteLLM
 
@@ -260,7 +286,7 @@ graph TD
     A["detect_hardware()"] --> B{"GPU detected?"}
     B -->|No| C["llamacpp"]
     B -->|Yes| D{"GPU vendor?"}
-    D -->|Apple| E["ollama"]
+    D -->|Apple| E["mlx"]
     D -->|NVIDIA| F{"Datacenter card?<br/>(A100, H100, H200,<br/>L40, A10, A30)"}
     F -->|Yes| G["vllm"]
     F -->|No| H["ollama"]
@@ -357,7 +383,7 @@ host = "http://localhost:30000"
 # binary_path = ""
 
 # [engine.lemonade]
-# host = "http://localhost:8000"
+# host = "http://localhost:13305"
 ```
 
 The `EngineConfig` dataclass and its per-engine sub-dataclasses map these settings:
@@ -370,7 +396,7 @@ The `EngineConfig` dataclass and its per-engine sub-dataclasses map these settin
 | `SGLangEngineConfig` | `host` | `http://localhost:30000` | SGLang server URL |
 | `LlamaCppEngineConfig` | `host` | `http://localhost:8080` | llama.cpp server URL |
 | `LlamaCppEngineConfig` | `binary_path` | `""` | Path to llama.cpp binary (for managed mode) |
-| `LemonadeEngineConfig` | `host` | `http://localhost:8000` | Lemonade server URL |
+| `LemonadeEngineConfig` | `host` | `http://localhost:13305` | Lemonade server URL |
 
 !!! note "Backward compatibility"
     The old flat field names `ollama_host`, `vllm_host`, `llamacpp_host`, `llamacpp_path`, `sglang_host`, and `lemonade_host` under `[engine]` are still accepted as backward-compatible properties on `EngineConfig`. New configurations should use the nested sub-section format.

@@ -56,7 +56,7 @@ function SidebarItem({
         ) : state === 'skipped' ? (
           <SkipForward size={16} style={{ color: 'var(--color-text-tertiary)' }} />
         ) : state === 'error' ? (
-          <Circle size={16} style={{ color: '#ef4444' }} />
+          <Circle size={16} style={{ color: 'var(--color-error)' }} />
         ) : (
           <Circle size={16} style={{ color: 'var(--color-text-tertiary)' }} />
         )}
@@ -198,7 +198,7 @@ function OAuthPanel({
           className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium self-start transition-all"
           style={{
             background: 'var(--color-accent)',
-            color: 'white',
+            color: 'var(--color-on-accent)',
           }}
         >
           <ExternalLink size={14} />
@@ -249,7 +249,7 @@ function LocalPanel({
         className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium self-start transition-all"
         style={{
           background: 'var(--color-accent)',
-          color: 'white',
+          color: 'var(--color-on-accent)',
           cursor: isConnecting ? 'not-allowed' : 'pointer',
           opacity: isConnecting ? 0.7 : 1,
         }}
@@ -283,9 +283,11 @@ function StepByStepPanel({
   onSkip: () => void;
   isConnecting: boolean;
 }) {
-  const [inputs, setInputs] = useState<Record<string, string>>({});
   const steps = connector.steps || [];
   const fields = connector.inputFields || [];
+  const [inputs, setInputs] = useState<Record<string, string>>(() =>
+    Object.fromEntries(fields.map((field) => [field.name, field.defaultValue || ''])),
+  );
 
   const updateInput = (name: string, value: string) => {
     setInputs((prev) => ({ ...prev, [name]: value }));
@@ -298,6 +300,11 @@ function StepByStepPanel({
       else if (field.name === 'password') req.password = inputs.password;
       else if (field.name === 'token') req.token = inputs.token;
       else if (field.name === 'path') req.path = inputs.path;
+      else if (field.name === 'host' && inputs.host?.trim()) req.host = inputs.host.trim();
+      else if (field.name === 'port' && inputs.port?.trim()) req.port = Number(inputs.port);
+      else if (field.name === 'security' && (inputs.security === 'tls' || inputs.security === 'starttls')) {
+        req.security = inputs.security;
+      }
     }
     // For email+password connectors, also set token as email:password
     if (req.email && req.password) {
@@ -310,7 +317,9 @@ function StepByStepPanel({
     onConnect(req);
   };
 
-  const allFilled = fields.every((f) => inputs[f.name]?.trim());
+  const allFilled = fields
+    .filter((field) => field.required !== false)
+    .every((field) => inputs[field.name]?.trim());
 
   return (
     <div style={{ padding: '0 4px' }}>
@@ -342,7 +351,7 @@ function StepByStepPanel({
           }}
         >
           <div style={{
-            color: '#7c3aed', fontSize: 11,
+            color: 'var(--color-accent-purple)', fontSize: 11,
             fontWeight: 600, marginBottom: 4,
           }}>
             STEP {i + 1}
@@ -359,7 +368,7 @@ function StepByStepPanel({
               target="_blank"
               rel="noopener noreferrer"
               style={{
-                color: '#60a5fa', fontSize: 12,
+                color: 'var(--color-accent)', fontSize: 12,
                 textDecoration: 'underline',
               }}
             >
@@ -378,24 +387,49 @@ function StepByStepPanel({
           marginBottom: 10,
         }}>
           {fields.map((field) => (
-            <input
-              key={field.name}
-              value={inputs[field.name] || ''}
-              onChange={(e) => updateInput(field.name, e.target.value)}
-              placeholder={field.placeholder}
-              type={field.type || 'text'}
-              style={{
-                width: '100%',
-                padding: '8px 10px',
-                background: 'var(--color-bg-secondary)',
-                border: '1px solid var(--color-border)',
-                borderRadius: 4,
-                color: 'var(--color-text)',
-                fontSize: 13,
-                marginBottom: 8,
-                boxSizing: 'border-box',
-              }}
-            />
+            field.type === 'select' ? (
+              <select
+                key={field.name}
+                value={inputs[field.name] || field.defaultValue || ''}
+                onChange={(e) => updateInput(field.name, e.target.value)}
+                aria-label={field.placeholder}
+                style={{
+                  width: '100%',
+                  padding: '8px 10px',
+                  background: 'var(--color-bg-secondary)',
+                  border: '1px solid var(--color-border)',
+                  borderRadius: 4,
+                  color: 'var(--color-text)',
+                  fontSize: 13,
+                  marginBottom: 8,
+                  boxSizing: 'border-box',
+                }}
+              >
+                {(field.options || []).map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            ) : (
+              <input
+                key={field.name}
+                value={inputs[field.name] || ''}
+                onChange={(e) => updateInput(field.name, e.target.value)}
+                placeholder={field.placeholder}
+                type={field.type || 'text'}
+                required={field.required !== false}
+                style={{
+                  width: '100%',
+                  padding: '8px 10px',
+                  background: 'var(--color-bg-secondary)',
+                  border: '1px solid var(--color-border)',
+                  borderRadius: 4,
+                  color: 'var(--color-text)',
+                  fontSize: 13,
+                  marginBottom: 8,
+                  boxSizing: 'border-box',
+                }}
+              />
+            )
           ))}
         </div>
       )}
@@ -414,8 +448,8 @@ function StepByStepPanel({
           style={{
             flex: 1, padding: 10,
             background: isConnecting || (fields.length > 0 && !allFilled)
-              ? '#444' : '#7c3aed',
-            color: 'white', border: 'none',
+              ? 'var(--color-disabled-bg)' : 'var(--color-accent-purple)',
+            color: 'var(--color-on-accent)', border: 'none',
             borderRadius: 6, fontSize: 13,
             cursor: 'pointer',
           }}
@@ -531,9 +565,9 @@ export function SourceConnectFlow({
                 <div
                   className="mt-3 px-4 py-3 rounded-lg text-sm"
                   style={{
-                    background: 'rgba(239,68,68,0.1)',
-                    border: '1px solid rgba(239,68,68,0.2)',
-                    color: '#ef4444',
+                    background: 'color-mix(in srgb, var(--color-error) 10%, transparent)',
+                    border: '1px solid color-mix(in srgb, var(--color-error) 20%, transparent)',
+                    color: 'var(--color-error)',
                   }}
                 >
                   {activeEntry.error}
@@ -549,6 +583,7 @@ export function SourceConnectFlow({
               </div>
             ) : activeCard.steps ? (
               <StepByStepPanel
+                key={activeCard.connector_id}
                 connector={activeCard}
                 onConnect={(req) => handleConnect(activeEntry.id, req)}
                 onSkip={() => handleSkip(activeEntry.id)}
@@ -593,7 +628,7 @@ export function SourceConnectFlow({
             <button
               onClick={onComplete}
               className="w-full py-3 px-4 rounded-xl font-semibold text-sm transition-all"
-              style={{ background: 'var(--color-accent)', color: 'white' }}
+              style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)' }}
             >
               Continue →
             </button>

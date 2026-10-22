@@ -53,6 +53,27 @@ LOGGER = logging.getLogger(__name__)
 _THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
+def _extract_continuous_score(scoring_meta, is_correct):
+    """Pull continuous score (0.0-1.0) from scoring_meta, falling back to binary.
+
+    Many scorers (LLM-judge, rubric, coverage) write a continuous ``score``
+    into ``scoring_meta``; we surface that instead of binarising. Any value
+    outside [0.0, 1.0] is clamped or rejected. When no continuous score is
+    available we fall back to 1.0/0.0 from ``is_correct``.
+    """
+    if isinstance(scoring_meta, dict):
+        cand = scoring_meta.get("score")
+        if isinstance(cand, (int, float)) and not isinstance(cand, bool):
+            v = float(cand)
+            if v != v or v == float("inf") or v == float("-inf"):
+                pass
+            else:
+                return max(0.0, min(1.0, v))
+    if is_correct is None:
+        return None
+    return 1.0 if is_correct else 0.0
+
+
 def _strip_think_tags(text: str) -> str:
     """Remove <think>...</think> blocks from model output."""
     return _THINK_TAG_RE.sub("", text).strip()
@@ -149,6 +170,17 @@ class EvalRunner:
                 LOGGER.debug("Task env thread-safety probe failed: %s", exc)
 
         records = list(self._dataset.iter_records())
+        if cfg.record_ids:
+            wanted = set(cfg.record_ids)
+            before = len(records)
+            records = [r for r in records if r.record_id in wanted]
+            LOGGER.info(
+                "Filtering %s to %d/%d records via record_ids (first 3: %s)",
+                cfg.benchmark,
+                len(records),
+                before,
+                ", ".join(sorted(wanted)[:3]),
+            )
         LOGGER.info(
             "Running %s: %d samples, backend=%s, model=%s, workers=%d, episode_mode=%s",
             cfg.benchmark,
@@ -240,7 +272,11 @@ class EvalRunner:
         if output_path:
             summary_path = output_path.with_suffix(".summary.json")
             with open(summary_path, "w") as f:
-                json.dump(_summary_to_dict(summary), f, indent=2)
+                json.dump(
+                    _summary_to_dict(summary, results=self._results),
+                    f,
+                    indent=2,
+                )
             LOGGER.info("Results written to %s", output_path)
             LOGGER.info("Summary written to %s", summary_path)
 
@@ -270,6 +306,44 @@ class EvalRunner:
     def _process_one(self, record: EvalRecord) -> EvalResult:
         """Process a single evaluation sample."""
         cfg = self._config
+
+        def _backend_error_result(full: dict, message: str) -> EvalResult:
+            usage = full.get("usage", {}) or {}
+            energy_j = full.get("energy_joules", 0.0) or 0.0
+            power_w = full.get("power_watts") or full.get("peak_power_w") or 0.0
+            return EvalResult(
+                record_id=record.record_id,
+                model_answer=full.get("content", "") or "",
+                error=message,
+                latency_seconds=full.get("latency_seconds", 0.0) or 0.0,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                cost_usd=full.get("cost_usd", 0.0) or 0.0,
+                ttft=full.get("ttft", 0.0) or 0.0,
+                energy_joules=energy_j,
+                power_watts=power_w,
+                cpu_energy_joules=full.get("cpu_energy_joules", 0.0) or 0.0,
+                gpu_energy_joules=full.get("gpu_energy_joules", 0.0) or 0.0,
+                dram_energy_joules=full.get("dram_energy_joules", 0.0) or 0.0,
+                ane_energy_joules=full.get("ane_energy_joules", 0.0) or 0.0,
+                soc_energy_joules=full.get("soc_energy_joules", 0.0) or 0.0,
+                energy_basis=full.get("energy_basis", "") or "",
+                energy_method=full.get("energy_method", "") or "",
+                gpu_utilization_pct=full.get("gpu_utilization_pct", 0.0) or 0.0,
+                throughput_tok_per_sec=full.get("throughput_tok_per_sec", 0.0) or 0.0,
+                trace_data=full.get("trace_data"),
+                framework=full.get(
+                    "framework",
+                    getattr(self._backend, "framework_name", "openjarvis"),
+                ),
+                framework_commit=full.get(
+                    "framework_commit",
+                    getattr(self._backend, "framework_commit_value", "") or "",
+                ),
+                tool_calls=int(full.get("tool_calls", 0) or 0),
+                turn_count=int(full.get("turn_count", 0) or 0),
+            )
+
         try:
             gen_kwargs: dict = dict(
                 model=cfg.model,
@@ -290,6 +364,8 @@ class EvalRunner:
                         **gen_kwargs,
                     )
                     full = full or {}
+                    if full.get("error"):
+                        return _backend_error_result(full, str(full["error"]))
                     all_tool_results = list(
                         full.get(
                             "tool_results",
@@ -309,6 +385,8 @@ class EvalRunner:
                                 **gen_kwargs,
                             )
                             sfull = sfull or {}
+                            if sfull.get("error"):
+                                return _backend_error_result(sfull, str(sfull["error"]))
                             all_tool_results.extend(
                                 sfull.get("tool_results", []),
                             )
@@ -326,6 +404,8 @@ class EvalRunner:
                     **gen_kwargs,
                 )
                 full = full or {}
+                if full.get("error"):
+                    return _backend_error_result(full, str(full["error"]))
                 content = full.get("content", "")
                 is_correct, scoring_meta = self._scorer.score(
                     record,
@@ -336,9 +416,13 @@ class EvalRunner:
             latency = full.get("latency_seconds", 0.0)
             cost = full.get("cost_usd", 0.0)
 
-            energy_j = full.get("energy_joules", 0.0)
-            power_w = full.get("power_watts", 0.0)
-            throughput = full.get("throughput_tok_per_sec", 0.0)
+            # Coerce None -> 0.0: backends may emit None when telemetry is
+            # unavailable (e.g., HermesBackend when no GPU sampler). The
+            # 'or 0.0' handles the case where the key is present but the
+            # value is None -- .get(default) only kicks in when missing.
+            energy_j = full.get("energy_joules", 0.0) or 0.0
+            power_w = full.get("power_watts") or full.get("peak_power_w") or 0.0
+            throughput = full.get("throughput_tok_per_sec", 0.0) or 0.0
             accuracy_score = 1.0 if is_correct else 0.0
 
             # Compute IPW and IPJ
@@ -385,24 +469,35 @@ class EvalRunner:
 
             # Extract derived and ITL metrics from _telemetry dict
             _telem = full.get("_telemetry", {})
-            energy_per_out_tok = _telem.get("energy_per_output_token_joules", 0.0)
-            throughput_per_w = _telem.get("throughput_per_watt", 0.0)
-            mean_itl = _telem.get("mean_itl_ms", 0.0)
+            energy_per_out_tok = (
+                _telem.get("energy_per_output_token_joules", 0.0) or 0.0
+            )
+            throughput_per_w = _telem.get("throughput_per_watt", 0.0) or 0.0
+            mean_itl = _telem.get("mean_itl_ms", 0.0) or 0.0
 
+            # Prefer continuous score from scoring_meta when scorer provides it.
+            score_val = _extract_continuous_score(scoring_meta, is_correct)
             return EvalResult(
                 record_id=record.record_id,
                 model_answer=content,
                 is_correct=is_correct,
-                score=1.0 if is_correct else (0.0 if is_correct is not None else None),
+                score=score_val,
                 latency_seconds=latency,
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
                 cost_usd=cost,
                 scoring_metadata=scoring_meta,
-                ttft=full.get("ttft", 0.0),
+                ttft=full.get("ttft", 0.0) or 0.0,
                 energy_joules=energy_j,
                 power_watts=power_w,
-                gpu_utilization_pct=full.get("gpu_utilization_pct", 0.0),
+                cpu_energy_joules=full.get("cpu_energy_joules", 0.0) or 0.0,
+                gpu_energy_joules=full.get("gpu_energy_joules", 0.0) or 0.0,
+                dram_energy_joules=full.get("dram_energy_joules", 0.0) or 0.0,
+                ane_energy_joules=full.get("ane_energy_joules", 0.0) or 0.0,
+                soc_energy_joules=full.get("soc_energy_joules", 0.0) or 0.0,
+                energy_basis=full.get("energy_basis", "") or "",
+                energy_method=full.get("energy_method", "") or "",
+                gpu_utilization_pct=full.get("gpu_utilization_pct", 0.0) or 0.0,
                 throughput_tok_per_sec=throughput,
                 mfu_pct=mfu,
                 mbu_pct=mbu,
@@ -413,6 +508,11 @@ class EvalRunner:
                 mean_itl_ms=mean_itl,
                 estimated_flops=estimated_flops,
                 trace_data=full.get("trace_data"),
+                # Spec §6.2 extended fields for cross-framework comparison
+                framework=full.get("framework", "openjarvis"),
+                framework_commit=full.get("framework_commit", ""),
+                tool_calls=int(full.get("tool_calls", 0)),
+                turn_count=int(full.get("turn_count", 0)),
             )
         except Exception as exc:
             LOGGER.error("Error processing %s: %s", record.record_id, exc)
@@ -420,6 +520,11 @@ class EvalRunner:
                 record_id=record.record_id,
                 model_answer="",
                 error=str(exc),
+                framework=getattr(self._backend, "framework_name", "openjarvis"),
+                framework_commit=getattr(self._backend, "framework_commit_value", "")
+                or "",
+                tool_calls=0,
+                turn_count=0,
             )
 
     # ------------------------------------------------------------------
@@ -684,17 +789,25 @@ class EvalRunner:
                 msg for msg in messages if msg.get("role") != "system"
             ]
 
+            score_val = _extract_continuous_score(scoring_meta, is_correct)
             return EvalResult(
                 record_id=record.record_id,
                 model_answer="\n---\n".join(all_responses),
                 is_correct=is_correct,
-                score=1.0 if is_correct else (0.0 if is_correct is not None else None),
+                score=score_val,
                 latency_seconds=total_latency,
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
                 cost_usd=total_cost,
                 scoring_metadata=scoring_meta,
                 trace_data=full.get("trace_data"),
+                # Spec §6.2 extended fields. framework/commit are constant
+                # per backend, so the last turn's value is correct. tool_calls
+                # / turn_count come from the interactive loop itself.
+                framework=full.get("framework", "openjarvis"),
+                framework_commit=full.get("framework_commit", ""),
+                tool_calls=int(full.get("tool_calls", 0)),
+                turn_count=len(all_responses),
             )
         except Exception as exc:
             LOGGER.error(
@@ -707,6 +820,11 @@ class EvalRunner:
                 model_answer="",
                 error=str(exc),
                 scoring_metadata={"interactive": True, "error": str(exc)},
+                framework=getattr(self._backend, "framework_name", "openjarvis"),
+                framework_commit=getattr(self._backend, "framework_commit_value", "")
+                or "",
+                tool_calls=0,
+                turn_count=0,
             )
         finally:
             if env is not None:
@@ -757,6 +875,13 @@ class EvalRunner:
             "ttft": result.ttft,
             "energy_joules": result.energy_joules,
             "power_watts": result.power_watts,
+            "cpu_energy_joules": result.cpu_energy_joules,
+            "gpu_energy_joules": result.gpu_energy_joules,
+            "dram_energy_joules": result.dram_energy_joules,
+            "ane_energy_joules": result.ane_energy_joules,
+            "soc_energy_joules": result.soc_energy_joules,
+            "energy_basis": result.energy_basis,
+            "energy_method": result.energy_method,
             "gpu_utilization_pct": result.gpu_utilization_pct,
             "throughput_tok_per_sec": result.throughput_tok_per_sec,
             "mfu_pct": result.mfu_pct,
@@ -852,6 +977,24 @@ class EvalRunner:
 
         accuracy = len(correct) / len(scored) if scored else 0.0
 
+        # Continuous-score reporting: skip None (errored) entries; clamp values
+        # outside [0,1] are already handled in _extract_continuous_score.
+        cont_scores = [float(r.score) for r in results if r.score is not None]
+        if cont_scores:
+            mean_cont = sum(cont_scores) / len(cont_scores)
+            median_cont = statistics.median(cont_scores)
+            pct_above_05 = sum(1 for v in cont_scores if v > 0.5) / len(cont_scores)
+            pct_above_07 = sum(1 for v in cont_scores if v > 0.7) / len(cont_scores)
+            pct_above_08 = sum(1 for v in cont_scores if v > 0.8) / len(cont_scores)
+            pct_above_09 = sum(1 for v in cont_scores if v > 0.9) / len(cont_scores)
+        else:
+            mean_cont = None
+            median_cont = None
+            pct_above_05 = None
+            pct_above_07 = None
+            pct_above_08 = None
+            pct_above_09 = None
+
         # Compute MetricStats for each metric
         accuracy_vals = [1.0 if r.is_correct else 0.0 for r in scored]
         latency_vals = [r.latency_seconds for r in results if r.latency_seconds > 0]
@@ -882,6 +1025,28 @@ class EvalRunner:
         ]
 
         total_energy = sum(r.energy_joules for r in results)
+        # Per-rail totals, so a summary says which hardware did the work
+        # rather than only how much it cost in aggregate.
+        rail_totals = {
+            rail: round(
+                sum(getattr(r, f"{rail}_energy_joules", 0.0) for r in results), 6
+            )
+            for rail in ("cpu", "gpu", "dram", "ane", "soc")
+        }
+        rail_totals = {k: v for k, v in rail_totals.items() if v > 0}
+
+        # How the energy was obtained, and from which rail set. Both are
+        # per-record, but a run uses one monitor throughout; report the value
+        # when it is unambiguous and flag genuine mixtures rather than
+        # silently picking one.
+        def _consensus(attr: str) -> str:
+            seen = {getattr(r, attr, "") for r in results if getattr(r, attr, "")}
+            if not seen:
+                return ""
+            return seen.pop() if len(seen) == 1 else "mixed"
+
+        energy_method_value = _consensus("energy_method")
+        energy_basis_value = _consensus("energy_basis")
         total_estimated_flops = sum(r.estimated_flops for r in results)
         total_input_tokens = sum(r.prompt_tokens for r in results)
         total_output_tokens = sum(r.completion_tokens for r in results)
@@ -893,6 +1058,9 @@ class EvalRunner:
             "total_energy_joules": round(total_energy, 6),
             "avg_power_watts": round(avg_power, 4),
             "total_estimated_flops": total_estimated_flops,
+            "energy_method": energy_method_value,
+            "energy_basis": energy_basis_value,
+            "energy_joules_by_rail": rail_totals or None,
             "ipj": (round(accuracy / total_energy, 6) if total_energy > 0 else None),
             "ipw": (round(accuracy / avg_power, 6) if avg_power > 0 else None),
         }
@@ -935,6 +1103,7 @@ class EvalRunner:
             input_token_stats=_metric_stats([float(v) for v in input_tok_vals]),
             output_token_stats=_metric_stats([float(v) for v in output_tok_vals]),
             total_energy_joules=round(total_energy, 6),
+            energy_method=energy_method_value,
             total_estimated_flops=total_estimated_flops,
             flops_stats=_metric_stats(flops_vals),
             warmup_samples_excluded=cfg.warmup_samples,
@@ -944,6 +1113,24 @@ class EvalRunner:
             efficiency=efficiency_dict,
             normalized_statistics=normalized_stats,
             normalized_efficiency=normalized_eff,
+            mean_continuous_score=(
+                round(mean_cont, 6) if mean_cont is not None else None
+            ),
+            median_continuous_score=(
+                round(median_cont, 6) if median_cont is not None else None
+            ),
+            pct_above_0_5=(
+                round(pct_above_05, 6) if pct_above_05 is not None else None
+            ),
+            pct_above_0_7=(
+                round(pct_above_07, 6) if pct_above_07 is not None else None
+            ),
+            pct_above_0_8=(
+                round(pct_above_08, 6) if pct_above_08 is not None else None
+            ),
+            pct_above_0_9=(
+                round(pct_above_09, 6) if pct_above_09 is not None else None
+            ),
         )
 
 
@@ -1051,9 +1238,18 @@ def _metric_stats_to_dict(ms: Optional[MetricStats]) -> Optional[Dict[str, float
     }
 
 
-def _summary_to_dict(s: RunSummary) -> Dict[str, Any]:
-    """Convert a RunSummary to a JSON-serializable dict."""
-    return {
+def _summary_to_dict(
+    s: RunSummary,
+    results: Optional[List[EvalResult]] = None,
+) -> Dict[str, Any]:
+    """Convert a RunSummary to a JSON-serializable dict.
+
+    When ``results`` is provided, the dict ALSO carries the spec §6.3
+    ``framework`` / ``framework_commit`` / ``n_tasks`` / ``metrics`` block
+    expected by the framework-comparison ``table_gen`` loader. Existing
+    top-level keys are preserved (this is purely additive).
+    """
+    d = {
         "hardware_info": _hardware_info_dict(),
         "benchmark": s.benchmark,
         "category": s.category,
@@ -1101,6 +1297,12 @@ def _summary_to_dict(s: RunSummary) -> Dict[str, Any]:
         "efficiency": s.efficiency,
         "normalized_statistics": s.normalized_statistics,
         "normalized_efficiency": s.normalized_efficiency,
+        "mean_continuous_score": s.mean_continuous_score,
+        "median_continuous_score": s.median_continuous_score,
+        "pct_above_0.5": s.pct_above_0_5,
+        "pct_above_0.7": s.pct_above_0_7,
+        "pct_above_0.8": s.pct_above_0_8,
+        "pct_above_0.9": s.pct_above_0_9,
         "telemetry_summary": {
             "total_energy_joules": s.total_energy_joules,
             "avg_power_watts": s.avg_power_watts,
@@ -1119,6 +1321,66 @@ def _summary_to_dict(s: RunSummary) -> Dict[str, Any]:
             "ipj": (s.efficiency.get("ipj") if s.efficiency else None),
         },
     }
+
+    # ---- Spec §6.3: table_gen-compatible flat schema ----
+    # In addition to the existing rich schema, emit framework / commit /
+    # per-metric stats so framework-comparison `table_gen.load_results`
+    # can parse this file as a `_SummarySchema` row.
+    fwk = "openjarvis"
+    fwk_commit = ""
+    if results:
+        for r in results:
+            if getattr(r, "framework", None):
+                fwk = r.framework
+                fwk_commit = r.framework_commit or ""
+                break
+
+    def _stats_block(vals: List[float]) -> Dict[str, Any]:
+        if not vals:
+            return {"mean": 0.0, "std": 0.0, "n": 0}
+        return {
+            "mean": float(statistics.fmean(vals)),
+            "std": (float(statistics.stdev(vals)) if len(vals) > 1 else 0.0),
+            "n": len(vals),
+        }
+
+    if results is not None:
+        scored = [r for r in results if r.is_correct is not None]
+        accuracy_vals = [1.0 if r.is_correct else 0.0 for r in scored]
+        latency_vals = [r.latency_seconds for r in results if r.latency_seconds > 0]
+        energy_vals = [r.energy_joules for r in results if r.energy_joules > 0]
+        in_tok_vals = [float(r.prompt_tokens) for r in results if r.prompt_tokens > 0]
+        out_tok_vals = [
+            float(r.completion_tokens) for r in results if r.completion_tokens > 0
+        ]
+        cost_vals = [r.cost_usd for r in results if r.cost_usd > 0]
+        power_vals = [r.power_watts for r in results if r.power_watts > 0]
+        n_tasks = len(results)
+    else:
+        accuracy_vals = []
+        latency_vals = []
+        energy_vals = []
+        in_tok_vals = []
+        out_tok_vals = []
+        cost_vals = []
+        power_vals = []
+        n_tasks = 0
+
+    d["framework"] = fwk
+    d["framework_commit"] = fwk_commit
+    # `model` and `benchmark` are already top-level above; keep them.
+    d["n_tasks"] = n_tasks
+    d["metrics"] = {
+        "accuracy": _stats_block(accuracy_vals),
+        "latency_seconds": _stats_block(latency_vals),
+        "energy_joules_per_query": _stats_block(energy_vals),
+        "input_tokens_per_query": _stats_block(in_tok_vals),
+        "output_tokens_per_query": _stats_block(out_tok_vals),
+        "cost_usd_per_query": _stats_block(cost_vals),
+        "peak_power_w": _stats_block(power_vals),
+    }
+
+    return d
 
 
 def _result_to_trace_dict(result: EvalResult) -> Dict[str, Any]:
@@ -1147,6 +1409,11 @@ def _result_to_trace_dict(result: EvalResult) -> Dict[str, Any]:
         "throughput_per_watt": result.throughput_per_watt,
         "mean_itl_ms": result.mean_itl_ms,
         "estimated_flops": result.estimated_flops,
+        # Spec §6.2 cross-framework fields
+        "framework": result.framework,
+        "framework_commit": result.framework_commit,
+        "tool_calls": result.tool_calls,
+        "turn_count": result.turn_count,
     }
     if result.trace_data is not None:
         d["trace_data"] = result.trace_data

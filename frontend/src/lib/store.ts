@@ -2,9 +2,12 @@ import { create } from 'zustand';
 import type {
   Conversation,
   ChatMessage,
+  LiveEnergyMetrics,
   LogEntry,
   ModelInfo,
   MessageTelemetry,
+  ResearchSearchTrace,
+  ResearchSource,
   SavingsData,
   ServerInfo,
   StreamState,
@@ -12,6 +15,16 @@ import type {
   TokenUsage,
 } from '../types';
 import type { ManagedAgent } from './api';
+import { isEmbedOnlyModel } from './model-capabilities';
+import { serializeToolCallArguments } from './tool-call';
+
+export interface CachedConnector {
+  connector_id: string;
+  display_name: string;
+  connected: boolean;
+  chunks: number;
+  auth_type: string;
+}
 
 export interface AgentEvent {
   type: string;
@@ -44,7 +57,30 @@ function loadConversations(): ConversationStore {
     const raw = localStorage.getItem(CONVERSATIONS_KEY);
     if (!raw) return { version: 1, conversations: {}, activeId: null };
     const parsed = JSON.parse(raw);
-    if (parsed.version === 1) return parsed;
+    if (parsed.version === 1) {
+      let repaired = false;
+      for (const conversation of Object.values(parsed.conversations ?? {}) as Conversation[]) {
+        for (const message of conversation.messages ?? []) {
+          for (const toolCall of message.toolCalls ?? []) {
+            const argumentsText = serializeToolCallArguments(toolCall.arguments);
+            if (argumentsText !== toolCall.arguments) {
+              toolCall.arguments = argumentsText;
+              repaired = true;
+            }
+          }
+        }
+      }
+      if (repaired) {
+        try {
+          localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(parsed));
+        } catch {
+          // Keep the repaired conversations usable in memory when storage is
+          // read-only or full. A failed best-effort writeback must not make
+          // otherwise readable conversation history disappear from the UI.
+        }
+      }
+      return parsed;
+    }
     return { version: 1, conversations: {}, activeId: null };
   } catch {
     return { version: 1, conversations: {}, activeId: null };
@@ -60,24 +96,33 @@ export type ThemeMode = 'light' | 'dark' | 'system';
 interface Settings {
   theme: ThemeMode;
   apiUrl: string;
+  // Local server API key (OPENJARVIS_API_KEY). Sent as a Bearer token on
+  // /v1 + /api requests so a key-protected `jarvis serve` doesn't 401 the
+  // frontend (#266). Empty = no auth header (keyless local default).
+  apiKey: string;
   fontSize: 'small' | 'default' | 'large';
   defaultModel: string;
   defaultAgent: string;
   temperature: number;
   maxTokens: number;
   speechEnabled: boolean;
+  voiceOutputEnabled: boolean;
+  voiceAutoplay: boolean;
 }
 
 function loadSettings(): Settings {
   const defaults: Settings = {
     theme: 'system',
     apiUrl: '',
+    apiKey: '',
     fontSize: 'default',
     defaultModel: '',
     defaultAgent: '',
     temperature: 0.7,
     maxTokens: 4096,
     speechEnabled: false,
+    voiceOutputEnabled: false,
+    voiceAutoplay: false,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -95,6 +140,7 @@ function saveSettings(settings: Settings): void {
 // ── Store ─────────────────────────────────────────────────────────────
 
 const INITIAL_STREAM: StreamState = {
+  conversationId: null,
   isStreaming: false,
   phase: '',
   elapsedMs: 0,
@@ -151,9 +197,15 @@ interface AppState {
     usage?: TokenUsage,
     telemetry?: MessageTelemetry,
     audio?: { url: string },
+    researchTraces?: ResearchSearchTrace[],
+    researchSources?: ResearchSource[],
   ) => void;
   setStreamState: (state: Partial<StreamState>) => void;
   resetStream: () => void;
+
+  // Deep Research toggle
+  deepResearch: boolean;
+  setDeepResearch: (on: boolean) => void;
 
   // Actions: models & server
   setModels: (models: ModelInfo[]) => void;
@@ -161,6 +213,13 @@ interface AppState {
   setSelectedModel: (model: string) => void;
   setServerInfo: (info: ServerInfo | null) => void;
   setSavings: (data: SavingsData | null) => void;
+  incrementSavings: (usage: TokenUsage) => void;
+
+  // Live GPU metrics — streamed from /api/research system_metrics events.
+  // When non-null, the System panel renders this instead of polled values
+  // so Power (W) and Energy (kJ) update in real time during a research run.
+  liveEnergy: LiveEnergyMetrics | null;
+  setLiveEnergy: (data: LiveEnergyMetrics | null) => void;
 
   // Actions: settings
   updateSettings: (partial: Partial<Settings>) => void;
@@ -171,6 +230,10 @@ interface AppState {
   setSidebarOpen: (open: boolean) => void;
   toggleSystemPanel: () => void;
   setSystemPanelOpen: (open: boolean) => void;
+
+  // Data sources (cached between visits to avoid empty-state flicker)
+  cachedConnectors: CachedConnector[] | null;
+  setCachedConnectors: (list: CachedConnector[] | null) => void;
 
   // Agents
   managedAgents: ManagedAgent[];
@@ -259,6 +322,12 @@ export const useAppStore = create<AppState>((set, get) => {
         const existing = store.conversations[overlay.id];
         // Only update if the overlay has newer/more messages
         if (existing && existing.messages.length >= overlay.messages.length) return;
+        // Track first use of overlay for this conversation
+        if (!existing) {
+          import('../lib/analytics').then(({ track }) => {
+            track('feature_used', { feature_name: 'overlay' });
+          });
+        }
         store.conversations[overlay.id] = {
           id: overlay.id,
           title: overlay.title || 'Overlay chat',
@@ -313,6 +382,9 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     deleteConversation: (id: string) => {
+      const streamState = get().streamState;
+      if (streamState.isStreaming && streamState.conversationId === id) return;
+
       const store = loadConversations();
       delete store.conversations[id];
       if (store.activeId === id) {
@@ -355,12 +427,14 @@ export const useAppStore = create<AppState>((set, get) => {
           (message.content.length > 50 ? '...' : '');
       }
       saveConversations(store);
-      set({
-        messages: [...conv.messages],
-        conversations: Object.values(store.conversations).sort(
-          (a, b) => b.updatedAt - a.updatedAt,
-        ),
-      });
+      const conversations = Object.values(store.conversations).sort(
+        (a, b) => b.updatedAt - a.updatedAt,
+      );
+      if (get().activeId === conversationId) {
+        set({ messages: [...conv.messages], conversations });
+      } else {
+        set({ conversations });
+      }
     },
 
     updateLastAssistant: (
@@ -370,6 +444,8 @@ export const useAppStore = create<AppState>((set, get) => {
       usage?: TokenUsage,
       telemetry?: MessageTelemetry,
       audio?: { url: string },
+      researchTraces?: ResearchSearchTrace[],
+      researchSources?: ResearchSource[],
     ) => {
       const store = loadConversations();
       const conv = store.conversations[conversationId];
@@ -381,9 +457,13 @@ export const useAppStore = create<AppState>((set, get) => {
         if (usage) lastMsg.usage = usage;
         if (telemetry) lastMsg.telemetry = telemetry;
         if (audio) lastMsg.audio = audio;
+        if (researchTraces) lastMsg.researchTraces = researchTraces;
+        if (researchSources) lastMsg.researchSources = researchSources;
         conv.updatedAt = Date.now();
         saveConversations(store);
-        set({ messages: [...conv.messages] });
+        if (get().activeId === conversationId) {
+          set({ messages: [...conv.messages] });
+        }
       }
     },
 
@@ -395,13 +475,70 @@ export const useAppStore = create<AppState>((set, get) => {
       set({ streamState: INITIAL_STREAM });
     },
 
+    // ── Deep Research ─────────────────────────────────────────────
+    deepResearch: false,
+    setDeepResearch: (on: boolean) => set({ deepResearch: on }),
+
     // ── Models & server ────────────────────────────────────────────
 
-    setModels: (models: ModelInfo[]) => set({ models }),
+    setModels: (models: ModelInfo[]) =>
+      set((state) => {
+        // Ollama returns embed-only models (e.g. nomic-embed-text) in the
+        // same list as chat models. Auto-picking models[0] selected the
+        // embedder and every chat failed with HTTP 400 "does not support
+        // chat". Prefer a real chat model for selection / fallback.
+        const chatModels = models.filter((m) => !isEmbedOnlyModel(m.id));
+        const preferred =
+          (state.settings.defaultModel &&
+            chatModels.some((m) => m.id === state.settings.defaultModel) &&
+            state.settings.defaultModel) ||
+          chatModels[0]?.id ||
+          models.find((m) => !isEmbedOnlyModel(m.id))?.id ||
+          '';
+
+        const currentIsBad =
+          !!state.selectedModel && isEmbedOnlyModel(state.selectedModel);
+        const currentMissing =
+          !!state.selectedModel &&
+          !models.some((m) => m.id === state.selectedModel);
+
+        if (!state.selectedModel || currentIsBad || currentMissing) {
+          // Prefer a real chat model. If none exist, clear a bad/missing
+          // selection rather than keeping an embed-only id that 400s on chat.
+          return {
+            models,
+            selectedModel: preferred,
+          };
+        }
+        return { models };
+      }),
     setModelsLoading: (loading: boolean) => set({ modelsLoading: loading }),
     setSelectedModel: (model: string) => set({ selectedModel: model }),
     setServerInfo: (info: ServerInfo | null) => set({ serverInfo: info }),
     setSavings: (data: SavingsData | null) => set({ savings: data }),
+    incrementSavings: (usage: TokenUsage) => {
+      const cur = get().savings;
+      const prompt = usage.prompt_tokens ?? 0;
+      const completion = usage.completion_tokens ?? 0;
+      const total = usage.total_tokens ?? prompt + completion;
+      set({
+        savings: {
+          total_calls: (cur?.total_calls ?? 0) + 1,
+          total_prompt_tokens: (cur?.total_prompt_tokens ?? 0) + prompt,
+          total_completion_tokens: (cur?.total_completion_tokens ?? 0) + completion,
+          total_tokens: (cur?.total_tokens ?? 0) + total,
+          local_cost: cur?.local_cost ?? 0,
+          per_provider: cur?.per_provider ?? [],
+          token_counting_version: cur?.token_counting_version,
+        },
+      });
+    },
+
+    liveEnergy: null,
+    setLiveEnergy: (data: LiveEnergyMetrics | null) => set({ liveEnergy: data }),
+
+    cachedConnectors: null,
+    setCachedConnectors: (list) => set({ cachedConnectors: list }),
 
     // ── Settings ───────────────────────────────────────────────────
 

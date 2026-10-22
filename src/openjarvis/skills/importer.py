@@ -3,14 +3,15 @@
 Steps performed by ``import_skill``:
 
 1. Parse the source SKILL.md through SkillParser (strict + tolerant).
-2. Translate tool references in the markdown body via ToolTranslator.
-3. Decide on scripts (default-skip; opt-in via with_scripts=True).
-4. Write to disk at <target_root>/<source>/<name>/:
+2. Reject symlinks in directories that would be copied into the install.
+3. Translate tool references in the markdown body via ToolTranslator.
+4. Decide on scripts (default-skip; opt-in via with_scripts=True).
+5. Write to disk at <target_root>/<source>/<name>/:
    - translated SKILL.md
    - references/, assets/, templates/ (always copied)
    - scripts/ (only if approved)
    - .source metadata file
-5. Return ImportResult with status, warnings, translated/missing tools.
+6. Return ImportResult with status, warnings, translated/missing tools.
 """
 
 from __future__ import annotations
@@ -23,7 +24,13 @@ from typing import List
 
 import yaml
 
+from openjarvis.core.paths import get_config_dir
 from openjarvis.skills.parser import SkillParser
+from openjarvis.skills.security import (
+    TrustTier,
+    classify_trust_tier,
+    has_dangerous_capabilities,
+)
 from openjarvis.skills.sources.base import ResolvedSkill
 from openjarvis.skills.tool_translator import ToolTranslator
 
@@ -42,6 +49,9 @@ class ImportResult:
     untranslated_tools: List[str] = field(default_factory=list)
     scripts_imported: bool = False
     warnings: List[str] = field(default_factory=list)
+    trust_tier: TrustTier = TrustTier.UNREVIEWED
+    dangerous_capabilities: List[str] = field(default_factory=list)
+    requires_confirmation: bool = False
 
 
 class SkillImporter:
@@ -56,7 +66,7 @@ class SkillImporter:
         self._parser = parser
         self._translator = tool_translator
         if target_root is None:
-            target_root = Path("~/.openjarvis/skills/").expanduser()
+            target_root = get_config_dir() / "skills"
         self._target_root = Path(target_root)
 
     def import_skill(
@@ -65,6 +75,7 @@ class SkillImporter:
         *,
         with_scripts: bool = False,
         force: bool = False,
+        confirm_dangerous: bool = False,
     ) -> ImportResult:
         """Install *resolved* into ``<target_root>/<source>/<name>/``.
 
@@ -94,13 +105,68 @@ class SkillImporter:
 
         try:
             frontmatter, body = self._read_skill_md(source_md)
-            self._parser.parse_frontmatter(frontmatter, markdown_content=body)
+            manifest = self._parser.parse_frontmatter(
+                frontmatter, markdown_content=body
+            )
         except Exception as exc:
             result.success = False
             result.warnings.append(f"Parse error: {exc}")
             return result
 
-        # 2. Translate tool references
+        # 1a. Classify trust and check for dangerous capabilities *before*
+        # writing anything to disk. Everything the importer handles comes from
+        # an external source (github/hermes/openclaw), so the BUNDLED and
+        # WORKSPACE tiers never apply here, and no resolver verifies index
+        # membership yet — a signature alone still classifies as UNREVIEWED.
+        # Community skills get no special treatment just because they came
+        # from a named source.
+        result.trust_tier = classify_trust_tier(
+            has_signature=bool(manifest.signature),
+        )
+        result.dangerous_capabilities = has_dangerous_capabilities(manifest)
+
+        if result.dangerous_capabilities and result.trust_tier == TrustTier.UNREVIEWED:
+            result.requires_confirmation = True
+            if not confirm_dangerous:
+                result.success = False
+                result.warnings.append(
+                    "Refusing to install: this unreviewed skill requests "
+                    f"dangerous capabilities {result.dangerous_capabilities}. "
+                    "Re-run with confirm_dangerous=True (or `--yes-dangerous` "
+                    "on the CLI) only if you trust the source and have "
+                    "reviewed what it does."
+                )
+                return result
+            result.warnings.append(
+                "Installed with dangerous capabilities "
+                f"{result.dangerous_capabilities} — confirmed by caller. "
+                "This skill can run shell commands, open network listeners, "
+                "and/or write to the filesystem."
+            )
+
+        # 2. Validate copied resources and translate tool references
+        copied_subdirs = list(COPIED_SUBDIRS)
+        if with_scripts:
+            copied_subdirs.append("scripts")
+        symlinks = [
+            link
+            for subdir in copied_subdirs
+            for link in self._find_symlinks(resolved.path / subdir)
+        ]
+        if symlinks:
+            names = ", ".join(
+                str(link.relative_to(resolved.path)) for link in symlinks[:3]
+            )
+            if len(symlinks) > 3:
+                names += f", and {len(symlinks) - 3} more"
+            result.success = False
+            result.warnings.append(
+                "Refusing to install: skill contains symlinked entries in "
+                f"copied directories ({names}). Imported skills must not "
+                "read files outside their source package."
+            )
+            return result
+
         translated_body, untranslated = self._translator.translate_markdown(body)
         result.untranslated_tools = untranslated
         # Compute the list of translations actually applied
@@ -144,6 +210,15 @@ class SkillImporter:
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _find_symlinks(root: Path) -> list[Path]:
+        """Return symlinks below *root* without following them."""
+        if not root.exists() and not root.is_symlink():
+            return []
+        if root.is_symlink():
+            return [root]
+        return [path for path in root.rglob("*") if path.is_symlink()]
+
     def _read_skill_md(self, path: Path) -> tuple[dict, str]:
         """Parse a SKILL.md file into (frontmatter dict, markdown body)."""
         raw = path.read_text(encoding="utf-8")
@@ -179,6 +254,7 @@ class SkillImporter:
         translated_str = ", ".join(f'"{t}"' for t in result.translated_tools)
         missing_str = ", ".join(f'"{t}"' for t in result.untranslated_tools)
         scripts_lower = "true" if result.scripts_imported else "false"
+        dangerous_str = ", ".join(f'"{c}"' for c in result.dangerous_capabilities)
 
         content = (
             f'source = "{resolved.source}:{resolved.name}"\n'
@@ -188,6 +264,8 @@ class SkillImporter:
             f"translated_tools = [{translated_str}]\n"
             f"missing_tools = [{missing_str}]\n"
             f"scripts_imported = {scripts_lower}\n"
+            f'trust_tier = "{result.trust_tier.value}"\n'
+            f"dangerous_capabilities = [{dangerous_str}]\n"
         )
         (target_dir / ".source").write_text(content, encoding="utf-8")
 

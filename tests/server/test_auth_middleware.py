@@ -28,6 +28,10 @@ def _make_app(api_key: str) -> FastAPI:
     async def twilio_webhook():
         return {"status": "received"}
 
+    @app.get("/metrics")
+    async def metrics():
+        return {"requests": 0}
+
     return app
 
 
@@ -65,7 +69,75 @@ class TestAuthMiddleware:
         resp = client.post("/webhooks/twilio")
         assert resp.status_code == 200
 
+    def test_metrics_requires_auth(self, client):
+        resp = client.get("/metrics")
+        assert resp.status_code == 401
+
+    def test_metrics_accepts_valid_key(self, client):
+        resp = client.get("/metrics", headers={"Authorization": "Bearer oj_sk_test123"})
+        assert resp.status_code == 200
+
     def test_no_key_configured_allows_all(self):
         client = TestClient(_make_app(""))
         resp = client.get("/v1/models")
         assert resp.status_code == 200
+        assert client.get("/metrics").status_code == 200
+
+    def test_cors_preflight_exempt(self, client):
+        """Regression for #758: browser preflights never carry Authorization,
+        so AuthMiddleware must not reject OPTIONS with 401 -- otherwise the
+        request never reaches CORSMiddleware and preflight fails outright."""
+        resp = client.options(
+            "/v1/models",
+            headers={
+                "Origin": "https://example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert resp.status_code != 401
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {},
+            {"Origin": "https://example.com"},
+            {"Access-Control-Request-Method": "GET"},
+        ],
+    )
+    def test_non_preflight_options_still_requires_auth(self, client, headers):
+        resp = client.options("/v1/models", headers=headers)
+        assert resp.status_code == 401
+
+
+class TestApiDocsAreGated:
+    """The OpenAPI schema and its viewers must not be readable unauthenticated.
+
+    On an exposed deployment they hand an attacker a complete map of every
+    route and payload shape, which is useful reconnaissance even though the
+    endpoints themselves are protected.
+    """
+
+    @pytest.mark.parametrize("path", ["/openapi.json", "/docs", "/redoc"])
+    def test_docs_require_auth(self, path):
+        app = _make_app("oj_sk_test123")
+        with TestClient(app) as c:
+            assert c.get(path).status_code == 401
+
+    @pytest.mark.parametrize("path", ["/openapi.json", "/docs"])
+    def test_docs_reachable_with_key(self, path):
+        app = _make_app("oj_sk_test123")
+        with TestClient(app) as c:
+            r = c.get(path, headers={"Authorization": "Bearer oj_sk_test123"})
+            assert r.status_code == 200
+
+    @pytest.mark.parametrize("path", ["/openapi.json", "/docs"])
+    def test_docs_open_when_no_key_configured(self, path):
+        """Keyless local use is unchanged — the middleware no-ops without a key."""
+        app = _make_app("")
+        with TestClient(app) as c:
+            assert c.get(path).status_code == 200
+
+    def test_health_stays_open(self):
+        app = _make_app("oj_sk_test123")
+        with TestClient(app) as c:
+            assert c.get("/health").status_code == 200

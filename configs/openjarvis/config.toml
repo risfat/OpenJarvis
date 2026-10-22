@@ -65,7 +65,15 @@ host = "http://localhost:18181"
 host = "http://localhost:8080"
 
 [engine.apple_fm]
-host = "http://localhost:8079"
+host = "http://localhost:8079"                # OpenAI-compatible shim
+
+# In-process Apple Foundation Models (macOS 26+, Apple Intelligence enabled).
+# Install with: uv pip install -e '.[afm]'
+[engine.afm]
+# instructions = ""                           # applied to every session
+# use_case = "general"                        # or "content_tagging"
+# guardrails = "default"                      # or "permissive_content_transformations"
+sampling = "greedy"                           # or "random" (the SDK default)
 
 # ═══════════════════════════════════════════════════════════════
 # PILLAR 5: Learning — Improvement Methodologies
@@ -106,9 +114,11 @@ enabled = true                            # Record traces for analysis
 db_path = "~/.openjarvis/traces.db"
 
 [server]
-host = "0.0.0.0"
+# Bind to loopback by default so the API is not exposed to the local network.
+# To serve other devices on your LAN, set host = "0.0.0.0" AND set an API key
+# (OPENJARVIS_API_KEY / `jarvis auth generate-key`) — startup refuses a
+# non-loopback bind without a key. The "server" security profile also flips
+# this to 0.0.0.0 intentionally.
+host = "127.0.0.1"
 port = 8000
 agent = "native_openhands"
-
-[security]
-enabled = false                           # Disable for eval (no PII scanning overhead)

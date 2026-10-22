@@ -64,24 +64,34 @@ jarvis ask "What is the capital of France?"
 | `--json`                      | flag    | off        | Output raw JSON result instead of plain text           |
 | `--no-stream`                 | flag    | off        | Disable streaming (synchronous mode)                   |
 | `--no-context`                | flag    | off        | Disable memory context injection                       |
-| `-a`, `--agent AGENT`         | string  | none       | Agent to use (`simple`, `orchestrator`)                |
+| `-a`, `--agent AGENT`         | string  | config (`simple`) | Agent to use; `""` selects direct mode            |
 | `--tools TOOLS`               | string  | none       | Comma-separated tool names to enable                   |
+| `-i`, `--image PATH`          | path    | none       | Image file for a vision model (e.g. `gemma3:4b`); repeatable |
+| `-S`, `--screen`              | flag    | off        | Capture the current screen and send it to the vision model  |
 
 ### Direct Mode vs Agent Mode
 
-**Direct mode** (default) sends the query straight to the inference engine:
+**Agent mode** is the default for text queries. When `--agent` is omitted, the CLI uses `agent.default_agent` from configuration, which defaults to `simple`. `SimpleAgent` makes a single inference call without a tool loop, while applying the configured system prompt and persona files (`SOUL.md`, `MEMORY.md`, and `USER.md`).
 
 ```bash
 jarvis ask "Explain quantum computing"
 ```
 
-**Agent mode** routes the query through an agent that can use tools and manage multi-turn interactions:
+Use `--agent` to select an agent explicitly. Agents such as `orchestrator` can use tools and manage multi-turn interactions:
 
 ```bash
 jarvis ask --agent orchestrator "What is 2+2?"
 jarvis ask --agent orchestrator --tools calculator,think "Calculate sqrt(144) + 3^2"
 jarvis ask --agent simple "Hello"
 ```
+
+**Direct mode** sends the query straight to the inference engine with optional memory context, bypassing the agent's system prompt and persona handling. Pass an empty agent name to select it:
+
+```bash
+jarvis ask --agent "" "Explain quantum computing"
+```
+
+To make direct mode the default, set `default_agent = ""` in the `[agent]` section of `~/.openjarvis/config.toml`.
 
 ### Usage Examples
 
@@ -104,6 +114,41 @@ jarvis ask --no-context "Tell me about Python"
 # Set maximum token generation
 jarvis ask --max-tokens 2048 "Write a detailed essay about AI"
 ```
+
+### Vision Input
+
+Vision-capable models (such as `gemma3:4b`) can read images alongside your
+text prompt. Attach one or more image files with `-i`/`--image`, or capture
+the current screen with `-S`/`--screen`:
+
+```bash
+# Ask about a local image
+jarvis ask -i screenshot.png "What is shown in this image?"
+
+# Send multiple images (the flag is repeatable)
+jarvis ask -i chart-a.png -i chart-b.png "Compare these two charts"
+
+# Capture the current screen and ask about it
+jarvis ask --screen "Summarize what's on my screen"
+```
+
+Vision runs in **direct mode** only. When `--agent` is omitted, image and screen
+queries automatically use direct mode, overriding the configured default agent.
+If you explicitly select an agent, the image is
+ignored and a note is printed — re-run with `--agent ""` to force direct mode.
+
+The Ollama context window can be tuned for large images or long prompts with
+the `JARVIS_NUM_CTX` environment variable (default `16384`):
+
+```bash
+JARVIS_NUM_CTX=8192 jarvis ask --screen "What's on my screen?"
+```
+
+!!! note "Keep vision on-device"
+    Images are sensitive. OpenJarvis prints a privacy warning before sending
+    an image to a non-local engine, so a screenshot never leaves your machine
+    unnoticed. Use a local engine (e.g. `ollama` with `gemma3:4b`) to keep
+    vision fully local.
 
 ### JSON Output Format
 
@@ -196,6 +241,35 @@ jarvis model pull qwen3:8b
 
 !!! note
     The `pull` command requires a running Ollama instance. It connects to the Ollama API at the host configured in your `config.toml`.
+
+---
+
+## `jarvis pearl`
+
+Access Pearl's native node, wallet, and RPC tools from the OpenJarvis CLI.
+
+```bash
+jarvis pearl doctor
+jarvis pearl node -- <pearld args>
+jarvis pearl wallet -- <oyster args>
+jarvis pearl ctl -- <prlctl args>
+jarvis pearl address
+```
+
+All Pearl wrapper commands use the `jarvis pearl <command>` shape. The
+pass-through commands map to Pearl's native binaries:
+
+| OpenJarvis command | Pearl binary | Use |
+|--------------------|--------------|-----|
+| `jarvis pearl doctor` | n/a | Check whether `pearld`, `oyster`, and `prlctl` are discoverable |
+| `jarvis pearl node` | `pearld` | Run the Pearl full node |
+| `jarvis pearl wallet` | `oyster` | Run the Oyster wallet daemon |
+| `jarvis pearl ctl` | `prlctl` | Query Pearl node or wallet RPC |
+| `jarvis pearl address` | `prlctl --wallet getnewaddress` | Generate a wallet address from Oyster |
+
+Use `PEARL_HOME=/path/to/pearl` or `--pearl-home /path/to/pearl` if Pearl's
+`bin/` directory is not on `PATH`. See the [Pearl CLI guide](pearl.md) for
+examples.
 
 ---
 
@@ -431,3 +505,17 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 When an agent is configured (e.g., `--agent orchestrator`), non-streaming requests are routed through the agent with access to all registered tools. For tool-capable agents (`orchestrator`, `react`, `openhands`), all registered tools are automatically loaded and made available.
+
+---
+
+## LLM-guided spec search (no CLI yet)
+
+LLM-guided spec search (the frontier-driven harness-learning subsystem)
+is exposed as a Python library only — there is currently no top-level
+`jarvis` subcommand for it. Construct a `SpecSearchOrchestrator`
+directly from `openjarvis.learning.spec_search.orchestrator` and call
+`.run(trigger)` with a trigger from
+`openjarvis.learning.spec_search.triggers`. See
+[`docs/user-guide/llm-guided-spec-search.md`](llm-guided-spec-search.md)
+for the architecture and the building blocks
+(`splits.py`, external corpora, `external_adapter`).

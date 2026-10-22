@@ -32,8 +32,7 @@ impl LoopGuard {
         // Check identical calls
         if self.seen_hashes.contains(&hash) {
             return Some(format!(
-                "Loop detected: identical call to '{}' with same arguments",
-                tool_name
+                "Loop detected: identical call to '{tool_name}' with same arguments"
             ));
         }
         self.seen_hashes.insert(hash);
@@ -83,7 +82,14 @@ impl LoopGuard {
         hasher.update(tool_name.as_bytes());
         hasher.update(b"|");
         hasher.update(arguments.as_bytes());
-        format!("{:x}", hasher.finalize())
+        let digest = hasher.finalize();
+        let mut encoded = String::with_capacity(digest.len() * 2);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in digest.iter().copied() {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
     }
 }
 

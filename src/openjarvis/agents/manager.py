@@ -7,12 +7,18 @@ to the five existing primitives (Intelligence, Agent, Tools, Engine, Learning).
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+import threading
 import time
 import uuid
-from pathlib import Path
+from functools import wraps
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+from openjarvis.core.paths import get_config_dir
+
+logger = logging.getLogger(__name__)
 
 _CREATE_AGENTS = """\
 CREATE TABLE IF NOT EXISTS managed_agents (
@@ -84,14 +90,37 @@ CREATE TABLE IF NOT EXISTS agent_learning_log (
 );
 """
 
-_SUMMARY_MAX = 2000
+# Rolling summary fed back into the next tick's prompt, so it stays bounded —
+# but 2000 chars clipped real research reports mid-sentence (the findings the
+# UI/CLI show come from here). 16k (~4k tokens) holds a full report while
+# keeping per-tick prompt growth in check.
+_SUMMARY_MAX = 16000
+
+
+def _db_locked(func):
+    """Serialize access to the connection shared by manager worker threads."""
+
+    @wraps(func)
+    def wrapped(self, *args, **kwargs):
+        with self._db_lock:
+            return func(self, *args, **kwargs)
+
+    return wrapped
 
 
 class AgentManager:
     """Persistent agent lifecycle manager with SQLite backing."""
 
-    def __init__(self, db_path: str) -> None:
+    # A tick that hasn't touched its DB row in this many seconds is treated
+    # as a zombie (its worker died without running end_tick). start_tick()
+    # will overtake such a lock instead of refusing forever. The executor
+    # bumps updated_at at start and on every tool/inference event, so a live
+    # tick stays well under this window.
+    _STALE_TICK_SECONDS = 600
+
+    def __init__(self, db_path: str, *, clear_stale_running: bool = False) -> None:
         self._db_path = str(db_path)
+        self._db_lock = threading.RLock()
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -114,6 +143,8 @@ class AgentManager:
             "ALTER TABLE managed_agents ADD COLUMN current_activity TEXT DEFAULT ''",
             "ALTER TABLE managed_agents ADD COLUMN input_tokens INTEGER DEFAULT 0",
             "ALTER TABLE managed_agents ADD COLUMN output_tokens INTEGER DEFAULT 0",
+            # JSON-encoded array of {tool, arguments, result, success, latency}
+            "ALTER TABLE agent_messages ADD COLUMN tool_calls TEXT",
         ]
         for migration in _MIGRATIONS:
             try:
@@ -121,12 +152,51 @@ class AgentManager:
             except sqlite3.OperationalError:
                 pass  # Column already exists
         self._conn.commit()
+        # Only the authoritative long-running process (the API server, which
+        # owns the scheduler) may sweep running→idle on boot. Short-lived CLI
+        # commands (`jarvis agents list/info/...`) and the SystemBuilder path
+        # used by `run`/`ask` MUST NOT: they share this DB with a server that
+        # may be mid-tick, and an unconditional sweep here flips an actively
+        # running agent back to "idle" — which is exactly why `list` reported
+        # "idle" while a tick was running elsewhere. Zombies left by a crashed
+        # worker are recovered lazily by start_tick()'s stale-lock overtake.
+        if clear_stale_running:
+            self._clear_stale_running_state()
 
+    @_db_locked
+    def _clear_stale_running_state(self) -> None:
+        """Reset any agent stuck in ``status='running'`` on startup.
+
+        Tick worker threads are ``daemon=True`` — when the server process
+        exits (SIGTERM, crash, restart), they die without running the
+        ``finally`` clause that calls :meth:`end_tick`, leaving the DB row
+        in ``running`` forever. The :meth:`start_tick` guard then rejects
+        every subsequent run with "Agent is already running".
+
+        The server boot holds zero tick locks by definition, so any persisted
+        ``running`` is a zombie. Sweep it back to ``idle`` and clear the
+        activity string so the UI doesn't show a stale "Preparing tick..."
+        indicator. Call this only from a process that owns tick execution.
+        """
+        cur = self._conn.execute(
+            "UPDATE managed_agents SET status = 'idle', current_activity = '',"
+            " updated_at = ? WHERE status = 'running'",
+            (time.time(),),
+        )
+        self._conn.commit()
+        if cur.rowcount:
+            logger.info(
+                "AgentManager: cleared stale 'running' status on %d agent(s)",
+                cur.rowcount,
+            )
+
+    @_db_locked
     def close(self) -> None:
         self._conn.close()
 
     # ── Agent CRUD ────────────────────────────────────────────────
 
+    @_db_locked
     def create_agent(
         self,
         name: str,
@@ -135,7 +205,8 @@ class AgentManager:
     ) -> Dict[str, Any]:
         agent_id = uuid.uuid4().hex[:12]
         now = time.time()
-        config_json = json.dumps(config or {})
+        config = dict(config or {})
+        config_json = json.dumps(config)
         self._conn.execute(
             "INSERT INTO managed_agents"
             " (id, name, agent_type, config_json,"
@@ -146,6 +217,7 @@ class AgentManager:
         self._conn.commit()
         return self.get_agent(agent_id)  # type: ignore[return-value]
 
+    @_db_locked
     def list_agents(self, include_archived: bool = False) -> List[Dict[str, Any]]:
         query = "SELECT * FROM managed_agents"
         if not include_archived:
@@ -154,12 +226,14 @@ class AgentManager:
         rows = self._conn.execute(query).fetchall()
         return [self._row_to_agent(r) for r in rows]
 
+    @_db_locked
     def get_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM managed_agents WHERE id = ?", (agent_id,)
         ).fetchone()
         return self._row_to_agent(row) if row else None
 
+    @_db_locked
     def update_agent(self, agent_id: str, **kwargs: Any) -> Dict[str, Any]:
         sets: List[str] = []
         vals: List[Any] = []
@@ -207,15 +281,19 @@ class AgentManager:
         self._conn.commit()
         return self.get_agent(agent_id)  # type: ignore[return-value]
 
+    @_db_locked
     def delete_agent(self, agent_id: str) -> None:
         self._set_status(agent_id, "archived")
 
+    @_db_locked
     def pause_agent(self, agent_id: str) -> None:
         self._set_status(agent_id, "paused")
 
+    @_db_locked
     def resume_agent(self, agent_id: str) -> None:
         self._set_status(agent_id, "idle")
 
+    @_db_locked
     def _set_status(self, agent_id: str, status: str) -> None:
         self._conn.execute(
             "UPDATE managed_agents SET status = ?, updated_at = ? WHERE id = ?",
@@ -225,17 +303,68 @@ class AgentManager:
 
     # ── Tick concurrency guard ────────────────────────────────────
 
+    @_db_locked
     def start_tick(self, agent_id: str) -> None:
-        """Mark agent as running. Raises ValueError if already running."""
-        agent = self.get_agent(agent_id)
-        if agent and agent["status"] == "running":
-            raise ValueError(f"Agent {agent_id} is already executing a tick")
-        self._set_status(agent_id, "running")
+        """Mark agent as running. Raises ValueError if already running.
 
+        A row that has been ``running`` longer than ``_STALE_TICK_SECONDS``
+        without any update is treated as a zombie left by a dead worker and
+        overtaken rather than refused — otherwise a crash with no server
+        around to sweep it would wedge the agent forever.
+
+        The state transition is a single conditional SQLite update.  The
+        read-before-write approach is racy when two workers start together:
+        both can observe ``idle`` and then mark the row ``running``.  The
+        conditional update lets SQLite choose exactly one winner, including
+        when workers use separate connections or processes.
+        """
+        while True:
+            now = time.time()
+            stale_before = now - self._STALE_TICK_SECONDS
+            agent = self.get_agent(agent_id)
+            if agent is None:
+                return
+
+            was_stale = (
+                agent["status"] == "running"
+                and (agent.get("updated_at") or 0) <= stale_before
+            )
+            cursor = self._conn.execute(
+                "UPDATE managed_agents SET status = 'running', "
+                "updated_at = ? WHERE id = ? AND "
+                "(status != 'running' OR updated_at <= ?)",
+                (now, agent_id, stale_before),
+            )
+            self._conn.commit()
+            if cursor.rowcount:
+                if was_stale:
+                    age = time.time() - (agent.get("updated_at") or 0)
+                    logger.warning(
+                        "Agent %s: overtaking stale tick lock "
+                        "(running, idle for %.0fs)",
+                        agent_id,
+                        age,
+                    )
+                return
+
+            # Another connection acquired the lock after our read.  If that
+            # lock is still fresh, this caller loses; if it ended between the
+            # failed update and this read, retry so the caller never proceeds
+            # without owning the tick lock.
+            current = self.get_agent(agent_id)
+            if current is None:
+                return
+            if current["status"] == "running":
+                age = time.time() - (current.get("updated_at") or 0)
+                if age < self._STALE_TICK_SECONDS:
+                    raise ValueError(f"Agent {agent_id} is already executing a tick")
+
+    @_db_locked
     def end_tick(self, agent_id: str) -> None:
         self._conn.execute(
             "UPDATE managed_agents SET status = 'idle', "
-            "current_activity = '', updated_at = ? WHERE id = ?",
+            "current_activity = '', updated_at = ? "
+            "WHERE id = ? AND status = 'running'",
             (time.time(), agent_id),
         )
         self._conn.commit()
@@ -244,6 +373,7 @@ class AgentManager:
 
     _CHECKPOINT_RETENTION = 5
 
+    @_db_locked
     def save_checkpoint(
         self,
         agent_id: str,
@@ -281,6 +411,7 @@ class AgentManager:
             "created_at": now,
         }
 
+    @_db_locked
     def list_checkpoints(self, agent_id: str) -> list:
         rows = self._conn.execute(
             "SELECT * FROM agent_checkpoints"
@@ -289,6 +420,7 @@ class AgentManager:
         ).fetchall()
         return [self._row_to_checkpoint(r) for r in rows]
 
+    @_db_locked
     def get_latest_checkpoint(self, agent_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM agent_checkpoints"
@@ -297,6 +429,7 @@ class AgentManager:
         ).fetchone()
         return self._row_to_checkpoint(row) if row else None
 
+    @_db_locked
     def recover_agent(self, agent_id: str) -> Optional[Dict[str, Any]]:
         checkpoint = self.get_latest_checkpoint(agent_id)
         # Always reset to idle — clearing the error state is the primary purpose
@@ -316,6 +449,7 @@ class AgentManager:
 
     # ── Summary memory ────────────────────────────────────────────
 
+    @_db_locked
     def update_summary_memory(self, agent_id: str, summary: str) -> None:
         truncated = summary[:_SUMMARY_MAX]
         self._conn.execute(
@@ -326,6 +460,7 @@ class AgentManager:
 
     # ── Task CRUD ─────────────────────────────────────────────────
 
+    @_db_locked
     def create_task(
         self, agent_id: str, description: str, status: str = "pending"
     ) -> Dict[str, Any]:
@@ -339,6 +474,7 @@ class AgentManager:
         self._conn.commit()
         return self._get_task(task_id)  # type: ignore[return-value]
 
+    @_db_locked
     def list_tasks(
         self, agent_id: str, status: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -351,6 +487,7 @@ class AgentManager:
         rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_task(r) for r in rows]
 
+    @_db_locked
     def update_task(self, task_id: str, **kwargs: Any) -> Dict[str, Any]:
         sets: List[str] = []
         vals: List[Any] = []
@@ -373,10 +510,12 @@ class AgentManager:
         self._conn.commit()
         return self._get_task(task_id)  # type: ignore[return-value]
 
+    @_db_locked
     def delete_task(self, task_id: str) -> None:
         self._conn.execute("DELETE FROM agent_tasks WHERE id = ?", (task_id,))
         self._conn.commit()
 
+    @_db_locked
     def _get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM agent_tasks WHERE id = ?", (task_id,)
@@ -385,6 +524,7 @@ class AgentManager:
 
     # ── Channel bindings ──────────────────────────────────────────
 
+    @_db_locked
     def bind_channel(
         self,
         agent_id: str,
@@ -404,22 +544,26 @@ class AgentManager:
         self._conn.commit()
         return self._get_binding(binding_id)  # type: ignore[return-value]
 
+    @_db_locked
     def list_channel_bindings(self, agent_id: str) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM channel_bindings WHERE agent_id = ?", (agent_id,)
         ).fetchall()
         return [self._row_to_binding(r) for r in rows]
 
+    @_db_locked
     def unbind_channel(self, binding_id: str) -> None:
         self._conn.execute("DELETE FROM channel_bindings WHERE id = ?", (binding_id,))
         self._conn.commit()
 
+    @_db_locked
     def _get_binding(self, binding_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM channel_bindings WHERE id = ?", (binding_id,)
         ).fetchone()
         return self._row_to_binding(row) if row else None
 
+    @_db_locked
     def find_binding_for_channel(
         self, channel_type: str, channel_id: str
     ) -> Optional[Dict[str, Any]]:
@@ -462,7 +606,7 @@ class AgentManager:
             pass
 
         # User templates
-        user_dir = Path("~/.openjarvis/templates").expanduser()
+        user_dir = get_config_dir() / "templates"
         if user_dir.is_dir():
             for f in user_dir.glob("*.toml"):
                 try:
@@ -501,6 +645,7 @@ class AgentManager:
 
     # ── Message queue ─────────────────────────────────────────────
 
+    @_db_locked
     def send_message(self, agent_id: str, content: str, mode: str = "queued") -> dict:
         msg_id = uuid4().hex[:16]
         now = time.time()
@@ -521,15 +666,29 @@ class AgentManager:
             "created_at": now,
         }
 
-    def store_agent_response(self, agent_id: str, content: str) -> dict:
-        """Store an agent-to-user response message."""
+    @_db_locked
+    def store_agent_response(
+        self,
+        agent_id: str,
+        content: str,
+        tool_calls: Optional[list] = None,
+    ) -> dict:
+        """Store an agent-to-user response message.
+
+        ``tool_calls`` is an optional list of ``{tool, arguments, result,
+        success, latency}`` dicts captured during the turn. They are stored
+        as JSON alongside the message so the UI can replay them after a
+        page reload.
+        """
         msg_id = uuid4().hex[:16]
         now = time.time()
+        tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         self._conn.execute(
             "INSERT INTO agent_messages"
-            " (id, agent_id, direction, content, mode, status, created_at)"
-            " VALUES (?, ?, 'agent_to_user', ?, 'immediate', 'delivered', ?)",
-            (msg_id, agent_id, content, now),
+            " (id, agent_id, direction, content, mode, status, created_at,"
+            " tool_calls)"
+            " VALUES (?, ?, 'agent_to_user', ?, 'immediate', 'delivered', ?, ?)",
+            (msg_id, agent_id, content, now, tool_calls_json),
         )
         self._conn.commit()
         return {
@@ -540,8 +699,10 @@ class AgentManager:
             "mode": "immediate",
             "status": "delivered",
             "created_at": now,
+            "tool_calls": tool_calls or None,
         }
 
+    @_db_locked
     def list_messages(self, agent_id: str, limit: int = 50) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM agent_messages"
@@ -550,6 +711,7 @@ class AgentManager:
         ).fetchall()
         return [self._row_to_message(r) for r in rows]
 
+    @_db_locked
     def get_pending_messages(self, agent_id: str) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM agent_messages"
@@ -559,6 +721,7 @@ class AgentManager:
         ).fetchall()
         return [self._row_to_message(r) for r in rows]
 
+    @_db_locked
     def mark_message_delivered(self, message_id: str) -> None:
         self._conn.execute(
             "UPDATE agent_messages SET status = 'delivered' WHERE id = ?",
@@ -566,6 +729,7 @@ class AgentManager:
         )
         self._conn.commit()
 
+    @_db_locked
     def add_agent_response(self, agent_id: str, content: str) -> dict:
         msg_id = uuid4().hex[:16]
         now = time.time()
@@ -588,6 +752,16 @@ class AgentManager:
 
     @staticmethod
     def _row_to_message(row: sqlite3.Row) -> dict:
+        tool_calls = None
+        try:
+            raw = row["tool_calls"]
+        except (IndexError, KeyError):
+            raw = None
+        if raw:
+            try:
+                tool_calls = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                tool_calls = None
         return {
             "id": row["id"],
             "agent_id": row["agent_id"],
@@ -596,10 +770,12 @@ class AgentManager:
             "mode": row["mode"],
             "status": row["status"],
             "created_at": row["created_at"],
+            "tool_calls": tool_calls,
         }
 
     # ── Learning log ──────────────────────────────────────────
 
+    @_db_locked
     def add_learning_log(
         self,
         agent_id: str,
@@ -625,6 +801,7 @@ class AgentManager:
             "created_at": now,
         }
 
+    @_db_locked
     def list_learning_log(self, agent_id: str, limit: int = 50) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM agent_learning_log"

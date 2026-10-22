@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
 import sys
 
 from openjarvis.core.registry import ToolRegistry
@@ -23,6 +24,10 @@ EXPECTED_TOOLS = {
     "file_write",
     # web_search.py
     "web_search",
+    # weather.py
+    "get_weather",
+    # fx_macro.py
+    "fx_macro_data",
     # code_interpreter.py
     "code_interpreter",
     # code_interpreter_docker.py
@@ -40,6 +45,8 @@ EXPECTED_TOOLS = {
     "channel_status",
     # http_request.py
     "http_request",
+    # docker_shell_exec.py
+    "docker_shell_exec",
     # shell_exec.py
     "shell_exec",
     # memory_manage.py
@@ -63,11 +70,38 @@ EXPECTED_TOOLS = {
     "image_generate",
     # audio_tool.py
     "audio_transcribe",
+    # text_to_speech.py
+    "text_to_speech",
+    # digest_collect.py
+    "digest_collect",
     # knowledge_tools.py
     "kg_add_entity",
     "kg_add_relation",
     "kg_query",
     "kg_neighbors",
+    # knowledge_sql.py
+    "knowledge_sql",
+    # scan_chunks.py
+    "scan_chunks",
+    # apple_calendar.py
+    "calendar_upcoming",
+    "calendar_search",
+    # knowledge_search.py
+    "knowledge_search",
+    # browser.py
+    "browser_navigate",
+    "browser_click",
+    "browser_type",
+    "browser_screenshot",
+    "browser_extract",
+    # browser_axtree.py
+    "browser_axtree",
+    # proactive_tools.py
+    "check_permission",
+    "queue_action",
+    "get_pending_actions",
+    "record_decision",
+    "execute_pending_actions",
 }
 
 
@@ -76,10 +110,12 @@ def _reload_tool_modules() -> None:
 
     The autouse ``_clean_registries`` fixture clears all registries before each
     test.  A plain ``import openjarvis.tools`` won't re-register because the
-    submodules are already cached in ``sys.modules``.  We must reload the
-    individual submodules so their class-level ``@ToolRegistry.register``
-    decorators execute again.
+    submodules are already cached in ``sys.modules``.  We ensure the package is
+    imported, then reload the individual submodules so their class-level
+    ``@ToolRegistry.register`` decorators execute again.
     """
+    import openjarvis.tools  # noqa: F401
+
     for mod_name in list(sys.modules):
         if (
             mod_name.startswith("openjarvis.tools.")
@@ -100,3 +136,72 @@ def test_all_builtin_tools_registered():
     assert not missing, (
         f"Tools not registered (missing import in __init__.py?): {sorted(missing)}"
     )
+
+
+def test_package_import_registers_deep_research_tools():
+    """Registration must not depend on another module being imported first."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import openjarvis.tools; "
+                "from openjarvis.core.registry import ToolRegistry; "
+                "expected = {'knowledge_sql', 'scan_chunks'}; "
+                "missing = expected - set(ToolRegistry.keys()); "
+                "assert not missing, f'Missing tools: {sorted(missing)}'"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_calendar_tools_register_when_connector_is_imported_first():
+    """Connector imports must not suppress calendar tool registration."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import openjarvis.connectors.apple_calendar; "
+                "from openjarvis.core.registry import ToolRegistry; "
+                "expected = {'calendar_upcoming', 'calendar_search'}; "
+                "missing = expected - set(ToolRegistry.keys()); "
+                "assert not missing, f'Missing tools: {sorted(missing)}'"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_package_import_registers_knowledge_browser_and_proactive_tools():
+    """Package import registers knowledge_search, browser, and proactive tools."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import openjarvis.tools; "
+                "from openjarvis.core.registry import ToolRegistry; "
+                "expected = {"
+                "'knowledge_search', 'browser_navigate', 'browser_axtree', "
+                "'check_permission', 'queue_action'"
+                "}; "
+                "missing = expected - set(ToolRegistry.keys()); "
+                "assert not missing, f'Missing tools: {sorted(missing)}'"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

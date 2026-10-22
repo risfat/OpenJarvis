@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -23,6 +32,12 @@ class AgentCreateRequest(BaseModel):
 
 class AgentMessageRequest(BaseModel):
     message: str
+
+
+class SpeechSynthesizeRequest(BaseModel):
+    text: str
+    voice_id: Optional[str] = None
+    speed: Optional[float] = None
 
 
 class MemoryStoreRequest(BaseModel):
@@ -62,9 +77,45 @@ class OptimizeRunRequest(BaseModel):
 agents_router = APIRouter(prefix="/v1/agents", tags=["agents"])
 
 
+def _execute_agent_admin_tool(request: Request, tool: Any, params: Dict[str, Any]):
+    """Execute an agent lifecycle operation through server security gates."""
+    from openjarvis.security.runtime import execute_secured_tool
+
+    state = request.app.state
+    return execute_secured_tool(
+        tool,
+        params,
+        bus=getattr(state, "bus", None),
+        capability_policy=getattr(state, "capability_policy", None),
+        rate_limiter=getattr(state, "rate_limiter", None),
+        agent_id="server:api",
+    )
+
+
+def _raise_agent_tool_failure(result: Any, *, not_found: bool = False) -> None:
+    if result.success:
+        return
+    if "Capability '" in result.content and " denied " in result.content:
+        raise HTTPException(status_code=403, detail=result.content)
+    if result.content.startswith("Rate limit exceeded"):
+        raise HTTPException(status_code=429, detail=result.content)
+    raise HTTPException(status_code=404 if not_found else 400, detail=result.content)
+
+
 @agents_router.get("")
 async def list_agents(request: Request):
     """List available agent types and running agents."""
+    try:
+        from openjarvis.tools.agent_tools import AgentListTool
+
+        # Registry names and live agent metadata are administrative state,
+        # just like spawn/send/kill.  Authorize before reading either source
+        # so default-deny and rate-limit policies cannot be bypassed by GET.
+        result = _execute_agent_admin_tool(request, AgentListTool(), {})
+        _raise_agent_tool_failure(result)
+    except ImportError:
+        raise HTTPException(status_code=501, detail="Agent tools not available")
+
     registered = []
     try:
         import openjarvis.agents  # noqa: F401 — side-effect registration
@@ -105,9 +156,8 @@ async def create_agent(req: AgentCreateRequest, request: Request):
             params["tools"] = ",".join(req.tools)
         if req.agent_id:
             params["agent_id"] = req.agent_id
-        result = tool.execute(**params)
-        if not result.success:
-            raise HTTPException(status_code=400, detail=result.content)
+        result = _execute_agent_admin_tool(request, tool, params)
+        _raise_agent_tool_failure(result)
         return {
             "status": "created",
             "content": result.content,
@@ -124,9 +174,8 @@ async def kill_agent(agent_id: str, request: Request):
         from openjarvis.tools.agent_tools import AgentKillTool
 
         tool = AgentKillTool()
-        result = tool.execute(agent_id=agent_id)
-        if not result.success:
-            raise HTTPException(status_code=404, detail=result.content)
+        result = _execute_agent_admin_tool(request, tool, {"agent_id": agent_id})
+        _raise_agent_tool_failure(result, not_found=True)
         return {"status": "stopped", "agent_id": agent_id}
     except ImportError:
         raise HTTPException(status_code=501, detail="Agent tools not available")
@@ -139,9 +188,12 @@ async def message_agent(agent_id: str, req: AgentMessageRequest, request: Reques
         from openjarvis.tools.agent_tools import AgentSendTool
 
         tool = AgentSendTool()
-        result = tool.execute(agent_id=agent_id, message=req.message)
-        if not result.success:
-            raise HTTPException(status_code=404, detail=result.content)
+        result = _execute_agent_admin_tool(
+            request,
+            tool,
+            {"agent_id": agent_id, "message": req.message},
+        )
+        _raise_agent_tool_failure(result, not_found=True)
         return {"status": "sent", "content": result.content}
     except ImportError:
         raise HTTPException(status_code=501, detail="Agent tools not available")
@@ -153,24 +205,42 @@ memory_router = APIRouter(prefix="/v1/memory", tags=["memory"])
 
 
 def _get_memory_backend(request: Request):
-    """Return the app-level memory backend, falling back to a fresh SQLiteMemory."""
+    """Return the app-level memory backend, falling back to a fresh SQLiteMemory.
+
+    Raises ``HTTPException(503)`` with an actionable message when the backend
+    cannot be built because the mandatory ``openjarvis_rust`` extension is not
+    installed in the serving venv. This is deliberately distinct from a benign
+    "memory not configured" case (which returns ``None``): a missing native
+    extension must fail loudly, never silently degrade (#502).
+    """
     backend = getattr(request.app.state, "memory_backend", None)
     if backend is None:
+        from openjarvis.tools.storage._stubs import MemoryBackendUnavailable
+
         try:
             from openjarvis.tools.storage.sqlite import SQLiteMemory
 
             backend = SQLiteMemory()
+        except MemoryBackendUnavailable as exc:
+            # The native extension is missing — surface a loud, actionable error
+            # rather than a misleading "no backend" / silent no-op.
+            logger.error("%s", exc)
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception:
+            # Memory is genuinely unconfigured for a benign reason — preserve
+            # the existing graceful "no backend" behaviour.
             return None
     return backend
 
 
 @memory_router.post("/store")
-async def memory_store(req: MemoryStoreRequest, request: Request):
+def memory_store(req: MemoryStoreRequest, request: Request):
     """Store content in memory."""
     backend = _get_memory_backend(request)
     if backend is None:
-        return {"status": "stored", "note": "no backend available"}
+        # Memory is intentionally disabled; report it honestly instead of a
+        # 200 that silently discards the write (#502).
+        raise HTTPException(status_code=503, detail="Memory is not configured")
     try:
         backend.store(req.content, metadata=req.metadata or {})
         return {"status": "stored"}
@@ -179,7 +249,7 @@ async def memory_store(req: MemoryStoreRequest, request: Request):
 
 
 @memory_router.post("/search")
-async def memory_search(req: MemorySearchRequest, request: Request):
+def memory_search(req: MemorySearchRequest, request: Request):
     """Search memory for relevant content."""
     backend = _get_memory_backend(request)
     if backend is None:
@@ -200,7 +270,7 @@ async def memory_search(req: MemorySearchRequest, request: Request):
 
 
 @memory_router.get("/stats")
-async def memory_stats(request: Request):
+def memory_stats(request: Request):
     """Get memory backend statistics."""
     backend = _get_memory_backend(request)
     if backend is None:
@@ -216,7 +286,13 @@ async def memory_stats(request: Request):
 
 @memory_router.get("/config")
 async def memory_config(request: Request):
-    """Return current memory configuration."""
+    """Return current memory configuration.
+
+    Reports memory as *unavailable* (rather than falsely claiming
+    ``backend_type: sqlite``) when the native ``openjarvis_rust`` extension is
+    missing, so the UI can show the real cause instead of a healthy-looking
+    config that backs a silent no-op (#502).
+    """
     try:
         config = getattr(request.app.state, "config", None)
         if config is None:
@@ -224,12 +300,30 @@ async def memory_config(request: Request):
 
             config = load_config()
         backend = getattr(request.app.state, "memory_backend", None)
+        available = True
+        detail: Optional[str] = None
+        if backend is None:
+            from openjarvis.tools.storage._stubs import MemoryBackendUnavailable
+
+            try:
+                from openjarvis.tools.storage.sqlite import SQLiteMemory
+
+                backend = SQLiteMemory()
+            except MemoryBackendUnavailable as exc:
+                available = False
+                detail = str(exc)
+            except Exception:
+                # Benign: cannot construct a probe backend here, but the
+                # configured default is still what would be used.
+                pass
         return {
             "backend_type": (
                 backend.backend_id
                 if backend is not None
                 else config.memory.default_backend
             ),
+            "available": available,
+            "detail": detail,
             "context_top_k": config.memory.context_top_k,
             "context_min_score": config.memory.context_min_score,
             "context_max_tokens": config.memory.context_max_tokens,
@@ -240,20 +334,43 @@ async def memory_config(request: Request):
 
 
 @memory_router.post("/index")
-async def memory_index(req: MemoryIndexRequest, request: Request):
+def memory_index(req: MemoryIndexRequest, request: Request):
     """Index files from a path into memory."""
     try:
+        import os
         from pathlib import Path
 
+        from openjarvis.security.file_policy import is_sensitive_file
         from openjarvis.tools.storage.ingest import ingest_path
 
         target = Path(req.path).expanduser().resolve()
         if not target.exists():
             raise HTTPException(status_code=404, detail=f"Path not found: {req.path}")
 
+        # Sandbox: when workspace roots are configured via OPENJARVIS_WORKSPACE
+        # (os.pathsep-separated), only allow indexing inside them. This endpoint
+        # must not become an arbitrary-filesystem read primitive over the API.
+        workspace = os.environ.get("OPENJARVIS_WORKSPACE", "").strip()
+        if workspace:
+            roots = [
+                Path(d).expanduser().resolve()
+                for d in workspace.split(os.pathsep)
+                if d.strip()
+            ]
+            if not any(target == root or root in target.parents for root in roots):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Path is outside the allowed workspace directories.",
+                )
+        # Never ingest sensitive files (.env, private keys, credentials, ...).
+        if target.is_file() and is_sensitive_file(target):
+            raise HTTPException(
+                status_code=403, detail="Refusing to index a sensitive file."
+            )
+
         backend = _get_memory_backend(request)
         if backend is None:
-            raise HTTPException(status_code=503, detail="No memory backend available")
+            raise HTTPException(status_code=503, detail="Memory is not configured")
 
         chunks = ingest_path(target)
         stored = 0
@@ -264,7 +381,16 @@ async def memory_index(req: MemoryIndexRequest, request: Request):
             backend.store(chunk.content, metadata=metadata)
             stored += 1
 
-        return {"status": "indexed", "chunks_indexed": stored}
+        result = {"status": "indexed", "chunks_indexed": stored}
+        if stored == 0:
+            # "indexed" must never silently mean "stored nothing". Surface why
+            # so a folder of short notes doesn't look like a successful no-op
+            # (#502 follow-up).
+            result["note"] = (
+                "no content was indexed — the path contained no readable "
+                "documents with indexable text"
+            )
+        return result
     except HTTPException:
         raise
     except Exception as exc:
@@ -334,16 +460,34 @@ async def get_trace(trace_id: str, request: Request):
 telemetry_router = APIRouter(prefix="/v1/telemetry", tags=["telemetry"])
 
 
+def _telemetry_db_path(request: Request) -> Path:
+    """Resolve telemetry storage from the active app configuration.
+
+    ``DEFAULT_CONFIG_DIR`` is fixed when :mod:`openjarvis.core.config` is
+    imported, so it cannot honor a later ``OPENJARVIS_HOME`` override.  The
+    running app's config is authoritative; lightweight apps that include these
+    routes directly fall back to the env-aware path resolver.
+    """
+    config = getattr(request.app.state, "config", None)
+    telemetry = getattr(config, "telemetry", None)
+    configured_path = getattr(telemetry, "db_path", None)
+    if configured_path:
+        return Path(configured_path).expanduser()
+
+    from openjarvis.core.paths import get_config_dir
+
+    return get_config_dir() / "telemetry.db"
+
+
 @telemetry_router.get("/stats")
 async def telemetry_stats(request: Request):
     """Get aggregated telemetry statistics."""
     try:
         from dataclasses import asdict
 
-        from openjarvis.core.config import DEFAULT_CONFIG_DIR
         from openjarvis.telemetry.aggregator import TelemetryAggregator
 
-        db_path = DEFAULT_CONFIG_DIR / "telemetry.db"
+        db_path = _telemetry_db_path(request)
         if not db_path.exists():
             return {"total_requests": 0, "total_tokens": 0}
 
@@ -366,10 +510,9 @@ async def telemetry_stats(request: Request):
 async def telemetry_energy(request: Request):
     """Get energy monitoring data."""
     try:
-        from openjarvis.core.config import DEFAULT_CONFIG_DIR
         from openjarvis.telemetry.aggregator import TelemetryAggregator
 
-        db_path = DEFAULT_CONFIG_DIR / "telemetry.db"
+        db_path = _telemetry_db_path(request)
         if not db_path.exists():
             return {
                 "total_energy_j": 0,
@@ -516,28 +659,36 @@ metrics_router = APIRouter(tags=["metrics"])
 async def prometheus_metrics(request: Request):
     """Prometheus-compatible metrics endpoint."""
     try:
-        from openjarvis.core.config import DEFAULT_CONFIG_DIR
         from openjarvis.telemetry.aggregator import TelemetryAggregator
 
-        db_path = DEFAULT_CONFIG_DIR / "telemetry.db"
+        db_path = _telemetry_db_path(request)
         if not db_path.exists():
             from starlette.responses import PlainTextResponse
 
             return PlainTextResponse("# no telemetry data\n", media_type="text/plain")
 
         agg = TelemetryAggregator(db_path)
-        stats = agg.summary()
+        try:
+            stats = agg.summary()
+        finally:
+            agg.close()
+
+        avg_latency_ms = (
+            (stats.total_latency / stats.total_calls) * 1000
+            if stats.total_calls
+            else 0.0
+        )
 
         lines = [
             "# HELP openjarvis_requests_total Total requests processed",
             "# TYPE openjarvis_requests_total counter",
-            f"openjarvis_requests_total {stats.get('total_requests', 0)}",
+            f"openjarvis_requests_total {stats.total_calls}",
             "# HELP openjarvis_tokens_total Total tokens generated",
             "# TYPE openjarvis_tokens_total counter",
-            f"openjarvis_tokens_total {stats.get('total_tokens', 0)}",
+            f"openjarvis_tokens_total {stats.total_tokens}",
             "# HELP openjarvis_latency_avg_ms Average latency in milliseconds",
             "# TYPE openjarvis_latency_avg_ms gauge",
-            f"openjarvis_latency_avg_ms {stats.get('avg_latency_ms', 0)}",
+            f"openjarvis_latency_avg_ms {avg_latency_ms}",
         ]
         from starlette.responses import PlainTextResponse
 
@@ -552,6 +703,64 @@ async def prometheus_metrics(request: Request):
 # ---- WebSocket streaming routes ----
 
 websocket_router = APIRouter(tags=["websocket"])
+_SYNC_STREAM_END = object()
+
+
+async def _next_sync_stream(iterator: Any) -> Any:
+    """Fetch one sync-stream item without blocking or racing cancellation."""
+    next_task = asyncio.create_task(asyncio.to_thread(next, iterator, _SYNC_STREAM_END))
+    try:
+        return await asyncio.shield(next_task)
+    except asyncio.CancelledError:
+        # ``to_thread`` cannot stop a running ``next()``. Wait for it before
+        # allowing the iterator to be closed so cancellation cannot race a
+        # generator that is still executing in the worker thread.
+        try:
+            await next_task
+        except Exception:
+            pass
+        raise
+
+
+async def _iterate_sync_stream(iterator: Any):
+    """Adapt a blocking iterator to an async generator, closing it safely."""
+    try:
+        while True:
+            item = await _next_sync_stream(iterator)
+            if item is _SYNC_STREAM_END:
+                return
+            yield item
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            try:
+                await asyncio.to_thread(close)
+            except Exception as exc:
+                logger.warning("Failed to close synchronous engine stream: %s", exc)
+
+
+def _record_ws_trace(
+    trace_store,
+    *,
+    query: str,
+    result: str,
+    model: str,
+    started_at: float,
+    ended_at: float,
+) -> None:
+    """Record a trace for a completed WebSocket chat (best-effort)."""
+    if trace_store is None or not result:
+        return
+    from openjarvis.traces.collector import record_response_trace
+
+    record_response_trace(
+        trace_store,
+        query=query,
+        result=result,
+        model=model,
+        started_at=started_at,
+        ended_at=ended_at,
+    )
 
 
 @websocket_router.websocket("/v1/chat/stream")
@@ -568,7 +777,15 @@ async def websocket_chat_stream(websocket: WebSocket):
         {"type": "done",  "content": "..."}   -- final assembled response
         {"type": "error", "detail": "..."}    -- on failure
     """
-    await websocket.accept()
+    from openjarvis.server.auth_middleware import authenticate_websocket
+
+    expected_key = getattr(websocket.app.state, "api_key", "")
+    authorized, subprotocol = authenticate_websocket(websocket, expected_key)
+    if not authorized:
+        # Closing before accept rejects the HTTP upgrade request.
+        await websocket.close(code=1008)
+        return
+    await websocket.accept(subprotocol=subprotocol)
     try:
         while True:
             raw = await websocket.receive_text()
@@ -601,6 +818,14 @@ async def websocket_chat_stream(websocket: WebSocket):
 
             messages = [{"role": "user", "content": message}]
 
+            # This WS path streams straight from the engine (no agent /
+            # TraceCollector), so record the interaction directly once it
+            # finishes — otherwise WebSocket chats never reach traces.db.
+            import time as _time
+
+            trace_store = getattr(websocket.app.state, "trace_store", None)
+            _ws_started_at = _time.time()
+
             try:
                 # Prefer streaming if the engine supports it
                 stream_fn = getattr(engine, "stream", None)
@@ -618,17 +843,20 @@ async def websocket_chat_stream(websocket: WebSocket):
                                     {"type": "chunk", "content": token},
                                 )
                         else:
-                            # Sync generator — iterate in a thread to avoid
-                            # blocking the event loop
-                            for token in gen:
+                            # Each ``next()`` can perform a blocking upstream
+                            # read, so offload iteration one item at a time.
+                            async for token in _iterate_sync_stream(iter(gen)):
                                 full_content += token
                                 await websocket.send_json(
                                     {"type": "chunk", "content": token},
                                 )
                     except TypeError:
                         # stream() didn't return an iterable; fall back to
-                        # generate()
-                        result = engine.generate(messages, model=model)
+                        # generate(). It makes a blocking upstream call, so run
+                        # it in a worker thread to keep the event loop free.
+                        result = await asyncio.to_thread(
+                            engine.generate, messages, model=model
+                        )
                         content = (
                             result.get("content", "")
                             if isinstance(
@@ -644,9 +872,20 @@ async def websocket_chat_stream(websocket: WebSocket):
                     await websocket.send_json(
                         {"type": "done", "content": full_content},
                     )
+                    _record_ws_trace(
+                        trace_store,
+                        query=message,
+                        result=full_content,
+                        model=model,
+                        started_at=_ws_started_at,
+                        ended_at=_time.time(),
+                    )
                 else:
-                    # No stream method — single-shot generate
-                    result = engine.generate(messages, model=model)
+                    # No stream method — single-shot generate. Blocking upstream
+                    # call, so run in a worker thread to keep the event loop free.
+                    result = await asyncio.to_thread(
+                        engine.generate, messages, model=model
+                    )
                     content = (
                         result.get("content", "")
                         if isinstance(
@@ -660,6 +899,14 @@ async def websocket_chat_stream(websocket: WebSocket):
                     )
                     await websocket.send_json(
                         {"type": "done", "content": content},
+                    )
+                    _record_ws_trace(
+                        trace_store,
+                        query=message,
+                        result=content,
+                        model=model,
+                        started_at=_ws_started_at,
+                        ended_at=_time.time(),
                     )
             except WebSocketDisconnect:
                 raise
@@ -762,7 +1009,20 @@ async def transcribe_speech(request: Request):
     filename = getattr(audio_file, "filename", "audio.wav")
     ext = filename.rsplit(".", 1)[-1] if "." in filename else "wav"
 
-    result = backend.transcribe(audio_bytes, format=ext, language=language or None)
+    try:
+        result = await asyncio.to_thread(
+            backend.transcribe,
+            audio_bytes,
+            format=ext,
+            language=language or None,
+        )
+    except Exception as exc:
+        logger.exception("Speech transcription failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Speech transcription failed: {exc}",
+        ) from exc
+
     return {
         "text": result.text,
         "language": result.language,
@@ -777,9 +1037,156 @@ async def speech_health(request: Request):
     backend = getattr(request.app.state, "speech_backend", None)
     if backend is None:
         return {"available": False, "reason": "No speech backend configured"}
+    try:
+        available = backend.health()
+        reason = None
+    except Exception as exc:
+        logger.exception("Speech health check failed")
+        available = False
+        reason = str(exc)
+
+    if not available and reason is None:
+        last_error = getattr(backend, "last_error", None)
+        if callable(last_error):
+            reason = last_error()
+
     return {
-        "available": backend.health(),
+        "available": available,
         "backend": backend.backend_id,
+        **({"reason": reason} if reason else {}),
+    }
+
+
+# Synthesis is CPU-bound and runs in a worker thread; cap the input so one
+# request cannot occupy that thread for minutes.
+_MAX_TTS_CHARS = 5000
+
+
+async def _resolve_tts_backend(request: Request):
+    """Return a healthy TTS backend, resolved once and cached on app state.
+
+    Backends load models on construction, so this stays lazy: a server whose
+    users never ask for audio never pays for it.
+    """
+    app = request.app
+    if getattr(app.state, "tts_resolved", False):
+        return getattr(app.state, "tts_backend", None)
+
+    # The first health probe can load Kokoro's model. A shared task keeps that
+    # work off the event loop and coalesces concurrent probes, including when
+    # the backend is unavailable. A later request may retry that failure.
+    task = getattr(app.state, "tts_resolution_task", None)
+    if task is None:
+
+        def discover():
+            from openjarvis.speech._tts_discovery import (
+                get_tts_backend,
+                voice_preferences,
+            )
+
+            config = getattr(app.state, "config", None)
+            if config is None:
+                from openjarvis.core.config import load_config
+
+                config = load_config()
+
+            preferred, _, _ = voice_preferences(config)
+            return get_tts_backend(preferred)
+
+        task = asyncio.create_task(asyncio.to_thread(discover))
+        app.state.tts_resolution_task = task
+
+    try:
+        backend = await asyncio.shield(task)
+    finally:
+        if task.done() and getattr(app.state, "tts_resolution_task", None) is task:
+            app.state.tts_resolution_task = None
+
+    if backend is not None:
+        app.state.tts_backend = backend
+        app.state.tts_resolved = True
+    return backend
+
+
+def _tts_voice_and_speed(request: Request, backend) -> tuple[str, float]:
+    """Resolve the voice ID and speed to use with *backend*.
+
+    Voice IDs are not portable between backends, so a configured ``voice_id``
+    applies only when the resolved backend is the configured one; otherwise the
+    fallback backend's own default is used.
+    """
+    from openjarvis.speech._tts_discovery import default_voice_for, voice_preferences
+
+    config = getattr(request.app.state, "config", None)
+    if config is None:
+        return "", 1.0
+
+    preferred, voice_id, speed = voice_preferences(config)
+    active = getattr(backend, "backend_id", "")
+    if active and active != preferred:
+        voice_id = default_voice_for(active)
+    return voice_id, speed
+
+
+@speech_router.post("/synthesize")
+async def synthesize_speech(request: Request, body: SpeechSynthesizeRequest):
+    """Synthesize text to speech and return the audio as WAV."""
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text'")
+    if len(text) > _MAX_TTS_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Text exceeds {_MAX_TTS_CHARS} characters",
+        )
+
+    backend = await _resolve_tts_backend(request)
+    if backend is None:
+        raise HTTPException(
+            status_code=501, detail="No text-to-speech backend available"
+        )
+
+    voice_id, speed = _tts_voice_and_speed(request, backend)
+    if body.voice_id:
+        voice_id = body.voice_id
+    if body.speed is not None:
+        speed = body.speed
+
+    try:
+        result = await asyncio.to_thread(
+            backend.synthesize,
+            text,
+            voice_id=voice_id,
+            speed=speed,
+            output_format="wav",
+        )
+    except Exception as exc:
+        logger.exception("Speech synthesis failed")
+        raise HTTPException(status_code=500, detail="Speech synthesis failed") from exc
+
+    return Response(
+        content=result.audio,
+        media_type="audio/wav",
+        headers={
+            "X-Voice-Id": result.voice_id or voice_id,
+            "X-Sample-Rate": str(result.sample_rate),
+        },
+    )
+
+
+@speech_router.get("/tts/health")
+async def tts_health(request: Request):
+    """Report whether voice output is available, and with which voice."""
+    backend = await _resolve_tts_backend(request)
+    if backend is None:
+        return {"available": False, "reason": "No text-to-speech backend available"}
+
+    voice_id, speed = _tts_voice_and_speed(request, backend)
+    return {
+        "available": True,
+        "backend": getattr(backend, "backend_id", ""),
+        "voice_id": voice_id,
+        "speed": speed,
     }
 
 
@@ -883,6 +1290,11 @@ async def start_optimize_run(req: OptimizeRunRequest, request: Request):
 
 def include_all_routes(app) -> None:
     """Include all extended API routers in a FastAPI app."""
+    from openjarvis.server.approval_routes import (
+        router as approval_router,  # noqa: PLC0415
+    )
+
+    app.include_router(approval_router)
     app.include_router(agents_router)
     app.include_router(memory_router)
     app.include_router(traces_router)
@@ -919,12 +1331,16 @@ def include_all_routes(app) -> None:
     except ImportError:
         pass
 
-    # WebSocket bridge for real-time agent events
+    # WebSocket bridge for real-time agent events. Must subscribe on the
+    # same EventBus instance channels/agents actually publish to
+    # (app.state.bus, set in server/app.py) — the get_event_bus() global
+    # singleton is a *different* bus that nothing in `jarvis serve` ever
+    # publishes to, so events silently never reached this endpoint.
     try:
         from openjarvis.core.events import get_event_bus
         from openjarvis.server.ws_bridge import create_ws_router
 
-        ws_router = create_ws_router(get_event_bus())
+        ws_router = create_ws_router(getattr(app.state, "bus", None) or get_event_bus())
         app.include_router(ws_router)
     except Exception:
         logger.debug("WebSocket bridge not available", exc_info=True)

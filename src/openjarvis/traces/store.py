@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -77,19 +80,36 @@ INSERT INTO trace_steps (
 """
 
 
+def _db_locked(func):
+    """Serialize access to the connection shared by trace worker threads."""
+
+    @wraps(func)
+    def wrapped(self, *args, **kwargs):
+        with self._db_lock:
+            return func(self, *args, **kwargs)
+
+    return wrapped
+
+
 class TraceStore:
     """Append-only SQLite store for interaction traces."""
 
     def __init__(self, db_path: str | Path) -> None:
-        self._db_path = str(db_path)
+        self._db_path = (
+            ":memory:"
+            if str(db_path) == ":memory:"
+            else str(Path(db_path).expanduser())
+        )
         if self._db_path != ":memory:":
             from openjarvis.security.file_utils import secure_create
 
             secure_create(Path(self._db_path))
-        # check_same_thread=False is safe with WAL mode.  The
-        # AgenticRunner dispatches agent work to a ThreadPoolExecutor
-        # (for Playwright compat), so trace writes may originate from
-        # a different thread than the one that opened the connection.
+        # The AgenticRunner dispatches agent work to a ThreadPoolExecutor
+        # (for Playwright compat), so trace writes may originate from a
+        # different thread than the one that opened the connection.
+        # check_same_thread=False permits that use, but WAL does not serialize
+        # operations on one connection, so use a lock too.
+        self._db_lock = threading.RLock()
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_CREATE_TRACES)
@@ -105,8 +125,17 @@ class TraceStore:
             pass  # Column already exists
         self._conn.commit()
 
+    @_db_locked
     def save(self, trace: Trace) -> None:
-        """Persist a complete trace with all its steps."""
+        """Persist a complete trace with all its steps.
+
+        ``trace_id`` is a primary key: saving a second, different trace under
+        an existing id raises ``sqlite3.IntegrityError`` (the external-corpus
+        adapter relies on this to surface duplicate record ids). The server
+        avoids re-saving the same trace by keeping the ``TraceCollector`` the
+        single writer — see ``server/app.py`` — rather than swallowing
+        collisions here.
+        """
         self._conn.execute(
             _INSERT_TRACE,
             (
@@ -144,6 +173,7 @@ class TraceStore:
             )
         self._conn.commit()
 
+    @_db_locked
     def get(self, trace_id: str) -> Optional[Trace]:
         """Retrieve a trace by id, or ``None`` if not found."""
         row = self._conn.execute(
@@ -153,6 +183,7 @@ class TraceStore:
             return None
         return self._row_to_trace(row)
 
+    @_db_locked
     def list_traces(
         self,
         *,
@@ -187,11 +218,13 @@ class TraceStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_trace(r) for r in rows]
 
+    @_db_locked
     def count(self) -> int:
         """Return the total number of stored traces."""
         row = self._conn.execute("SELECT COUNT(*) FROM traces").fetchone()
         return row[0] if row else 0
 
+    @_db_locked
     def search(
         self,
         query: str,
@@ -199,14 +232,26 @@ class TraceStore:
         agent: str | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Full-text search across traces. Optionally filter by agent."""
+        """Full-text search across traces. Optionally filter by agent.
+
+        Parameters
+        ----------
+        query: Plain-text search query (FTS5 punctuation is handled internally).
+        agent: Restrict results to traces recorded by this agent.
+        limit: Maximum number of results to return.
+        """
+        terms = re.findall(r"\w+", query)
+        if not terms:
+            return []
+        fts_query = " OR ".join(f'"{term}"' for term in terms)
+
         sql = (
             "SELECT t.trace_id, t.query, t.result, t.agent, t.model, t.outcome,"
             " t.started_at "
             "FROM traces_fts f JOIN traces t ON f.rowid = t.rowid "
             "WHERE traces_fts MATCH ?"
         )
-        params: list[Any] = [query]
+        params: list[Any] = [fts_query]
         if agent:
             sql += " AND t.agent = ?"
             params.append(agent)
@@ -215,8 +260,13 @@ class TraceStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [
             {
-                "trace_id": r[0], "query": r[1], "result": r[2],
-                "agent": r[3], "model": r[4], "outcome": r[5], "started_at": r[6],
+                "trace_id": r[0],
+                "query": r[1],
+                "result": r[2],
+                "agent": r[3],
+                "model": r[4],
+                "outcome": r[5],
+                "started_at": r[6],
             }
             for r in rows
         ]
@@ -230,6 +280,7 @@ class TraceStore:
         if isinstance(trace, Trace):
             self.save(trace)
 
+    @_db_locked
     def update_feedback(self, trace_id: str, score: float) -> bool:
         """Update the feedback score for a trace.
 
@@ -242,12 +293,14 @@ class TraceStore:
         self._conn.commit()
         return cursor.rowcount > 0
 
+    @_db_locked
     def close(self) -> None:
         """Close the underlying SQLite connection."""
         self._conn.close()
 
     # -- internal helpers ------------------------------------------------------
 
+    @_db_locked
     def _row_to_trace(self, row: tuple) -> Trace:
         """Convert a traces table row + its steps into a Trace object."""
         trace_id = row[1]
@@ -287,6 +340,7 @@ class TraceStore:
             steps=steps,
         )
 
+    @_db_locked
     def _fetchall(self, sql: str = "SELECT * FROM traces") -> list:
         return self._conn.execute(sql).fetchall()
 

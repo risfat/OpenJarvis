@@ -64,6 +64,28 @@ def test_store_and_retrieve_basic(ks: KnowledgeStore) -> None:
     assert results[0].score > 0.0
 
 
+@pytest.mark.parametrize(
+    "query",
+    ["Alice's birthday", "When is Alice's birthday?", "Alice-birthday"],
+)
+def test_retrieve_accepts_plain_text_punctuation(
+    ks: KnowledgeStore, query: str
+) -> None:
+    """Natural queries should find matching content without FTS5 syntax rules."""
+    _store(ks, content="Alice's birthday is May 2", source="notes")
+
+    results = ks.retrieve(query)
+
+    assert any("birthday is May 2" in result.content for result in results)
+
+
+def test_retrieve_accepts_symbol_heavy_terms(ks: KnowledgeStore) -> None:
+    _store(ks, content="The C++ migration guide", source="notes")
+
+    assert ks.retrieve("C++")
+    assert ks.retrieve("++") == []
+
+
 def test_retrieve_filter_by_source(ks: KnowledgeStore) -> None:
     """retrieve() with source= returns only chunks from that source."""
     _store(ks, content="Email about project alpha", source="gmail", doc_type="email")
@@ -202,6 +224,58 @@ def test_delete_by_doc_id(ks: KnowledgeStore) -> None:
     assert ks.delete("nonexistent:doc") is False
 
 
+def test_delete_by_source(ks: KnowledgeStore) -> None:
+    """delete_by_source() removes only chunks from the given source.
+
+    Regression: reconnecting a filesystem connector (e.g. Obsidian) to a
+    different underlying vault left the OLD vault's chunks in the store
+    forever. If the new vault happened to contain a file at the same
+    relative path (e.g. both vaults have a "Welcome.md"), the resulting
+    doc_id collided with the old, orphaned chunk -- and the ingestion
+    pipeline's duplicate-doc_id dedup silently discarded the new content,
+    leaving permanently stale data indexed with no error surfaced.
+    Disconnecting a connector must purge its previously-ingested content
+    so a later reconnect (to the same or a different source) starts clean.
+    """
+    _store(
+        ks,
+        content="Old vault welcome note content",
+        source="obsidian",
+        doc_id="obsidian:Welcome.md",
+    )
+    _store(
+        ks,
+        content="Unrelated note from another connector",
+        source="notion",
+        doc_id="notion:Some Page",
+    )
+
+    deleted = ks.delete_by_source("obsidian")
+    assert deleted == 1
+
+    after = ks.retrieve("welcome", top_k=10)
+    for r in after:
+        assert r.metadata.get("source") != "obsidian"
+
+    # The other source's content must be untouched.
+    remaining = ks.retrieve("unrelated note connector", top_k=10)
+    assert any(r.metadata.get("source") == "notion" for r in remaining)
+
+    # No matching source is a no-op, not an error.
+    assert ks.delete_by_source("nonexistent_source") == 0
+
+
+def test_delete_by_sources_removes_all_owned_sources_atomically(
+    ks: KnowledgeStore,
+) -> None:
+    _store(ks, content="first owned source", source="owned_a")
+    _store(ks, content="second owned source", source="owned_b")
+    _store(ks, content="unrelated source", source="other")
+
+    assert ks.delete_by_sources(("owned_a", "owned_b")) == 2
+    assert ks.distinct_sources() == ["other"]
+
+
 def test_clear(ks: KnowledgeStore) -> None:
     """clear() removes all stored documents."""
     _store(ks, content="Document one about research")
@@ -306,6 +380,39 @@ def test_retrieve_filter_by_until(ks: KnowledgeStore) -> None:
     assert len(results) >= 1
 
 
+def test_retrieve_empty_string_filters_do_not_suppress_results(
+    ks: KnowledgeStore,
+) -> None:
+    """Empty or whitespace-only filter strings are ignored instead of matching
+    literal empty values.
+    """
+    _store(
+        ks,
+        content="Important deployment documentation for project alpha",
+        source="notion",
+        doc_type="doc",
+        author="alice@example.com",
+    )
+
+    results = ks.retrieve(
+        "deployment documentation",
+        source="",
+        doc_type="   ",
+        author="",
+        since="",
+        until=" ",
+    )
+    assert len(results) >= 1
+    assert results[0].metadata.get("source") == "notion"
+
+
+def test_retrieve_non_string_source_does_not_drop_filter(ks: KnowledgeStore) -> None:
+    """Unexpected filter types must not broaden a source-restricted query."""
+    _store(ks, content="Deployment notes for project alpha", source="notion")
+
+    assert ks.retrieve("deployment", source=42) == []  # type: ignore[arg-type]
+
+
 def test_memory_store_event_emitted(tmp_path: Path) -> None:
     """MEMORY_STORE event is published on store()."""
     from openjarvis.core.events import EventType, get_event_bus, reset_event_bus
@@ -333,3 +440,130 @@ def test_memory_retrieve_event_emitted(tmp_path: Path) -> None:
 
     types = [e.event_type for e in bus.history]
     assert EventType.MEMORY_RETRIEVE in types
+
+
+# ---------------------------------------------------------------------------
+# v1 schema tests
+# ---------------------------------------------------------------------------
+
+
+def test_v1_columns_round_trip_via_metadata(ks: KnowledgeStore) -> None:
+    """source_id, channel, content_hash, embedding_model_version, participants_raw
+    survive the store/retrieve round-trip via the metadata payload."""
+    _store(
+        ks,
+        content="Email about partnership review",
+        source="gmail",
+        source_id="msg-abc123",
+        channel="INBOX",
+        content_hash="deadbeefcafe",
+        embedding_model_version="text-embedding-3-small/v1",
+        participants_raw=["Alice Bose <alice@example.com>"],
+    )
+    results = ks.retrieve("partnership review", top_k=1)
+    assert len(results) == 1
+    meta = results[0].metadata
+    assert meta.get("source_id") == "msg-abc123"
+    assert meta.get("channel") == "INBOX"
+    assert meta.get("content_hash") == "deadbeefcafe"
+    assert meta.get("embedding_model_version") == "text-embedding-3-small/v1"
+    assert meta.get("participants_raw") == ["Alice Bose <alice@example.com>"]
+
+
+def test_deleted_at_filters_retrieve(ks: KnowledgeStore) -> None:
+    """Rows with non-NULL deleted_at are excluded from retrieve()."""
+    import time as _time
+
+    _store(ks, content="Live document about quarterly research")
+    _store(ks, content="Tombstoned document about quarterly research")
+
+    ks._conn.execute(
+        "UPDATE knowledge_chunks SET deleted_at = ? WHERE content LIKE 'Tombstoned%'",
+        (_time.time(),),
+    )
+    ks._conn.commit()
+
+    results = ks.retrieve("quarterly research", top_k=10)
+    assert len(results) == 1
+    assert results[0].content.startswith("Live")
+
+
+def test_unique_natural_key_constraint(ks: KnowledgeStore) -> None:
+    """Duplicate (source, source_id, chunk_index) is silently skipped.
+
+    The store uses ``INSERT OR IGNORE`` so re-running a sync or replaying a
+    dogfood script over an already-populated store no longer crashes; the
+    original row stays put and the duplicate is dropped.
+    """
+    first_id = _store(
+        ks,
+        content="First copy",
+        source="gmail",
+        source_id="msg-unique-1",
+        chunk_index=0,
+    )
+    second_id = _store(
+        ks,
+        content="Duplicate copy",
+        source="gmail",
+        source_id="msg-unique-1",
+        chunk_index=0,
+    )
+    # Same identity — the natural key collision returned the existing row's id.
+    assert second_id == first_id
+    # Content of the original row is preserved.
+    row = ks._conn.execute(
+        "SELECT content FROM knowledge_chunks WHERE id = ?", (first_id,)
+    ).fetchone()
+    assert row["content"] == "First copy"
+    # Only one row exists for this natural key.
+    count = ks._conn.execute(
+        "SELECT COUNT(*) FROM knowledge_chunks "
+        "WHERE source = 'gmail' AND source_id = 'msg-unique-1' AND chunk_index = 0"
+    ).fetchone()[0]
+    assert count == 1
+
+
+def test_unique_constraint_skipped_when_source_id_empty(ks: KnowledgeStore) -> None:
+    """Legacy rows with empty source_id can co-exist (partial index excludes them)."""
+    _store(ks, content="Legacy doc one", source="legacy", source_id="")
+    # Should not raise — partial index is WHERE source_id != ''
+    _store(ks, content="Legacy doc two", source="legacy", source_id="")
+    assert ks.count() == 2
+
+
+def test_embedding_blob_round_trip(ks: KnowledgeStore) -> None:
+    """A bytes embedding payload survives storage and reads back unchanged."""
+    payload = b"\x00\x01\x02\x03\x04\xff\xfe\xfd"
+    _store(
+        ks,
+        content="Vector-bearing document for embedding round trip",
+        source="test",
+        embedding=payload,
+    )
+    row = ks._conn.execute("SELECT embedding FROM knowledge_chunks LIMIT 1").fetchone()
+    assert bytes(row[0]) == payload
+
+
+def test_context_manager_closes_connection(tmp_path: Path) -> None:
+    """Used as a context manager, KnowledgeStore closes its connection on exit."""
+    import sqlite3
+
+    with KnowledgeStore(db_path=tmp_path / "ctx.db") as ks:
+        _store(ks, content="inside with", source="test")
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        ks._conn.execute("SELECT 1")
+
+
+def test_context_manager_closes_on_exception(tmp_path: Path) -> None:
+    """The connection is closed even when the with block raises."""
+    import sqlite3
+
+    ks = KnowledgeStore(db_path=tmp_path / "ctx_exc.db")
+    with pytest.raises(RuntimeError):
+        with ks:
+            raise RuntimeError("boom")
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        ks._conn.execute("SELECT 1")

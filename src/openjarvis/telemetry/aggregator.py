@@ -33,6 +33,11 @@ class ModelStats:
     avg_throughput_per_watt: float = 0.0
     total_prefill_energy_joules: float = 0.0
     total_decode_energy_joules: float = 0.0
+    # Per-rail totals. `total_ane_energy_joules` is what makes an ANE-resident
+    # backend (Apple Foundation Models) legible here at all -- on the GPU rail
+    # alone it looks like it did no work.
+    total_ane_energy_joules: float = 0.0
+    total_soc_energy_joules: float = 0.0
     avg_mean_itl_ms: float = 0.0
     avg_median_itl_ms: float = 0.0
     avg_p95_itl_ms: float = 0.0
@@ -57,6 +62,11 @@ class EngineStats:
     avg_throughput_per_watt: float = 0.0
     total_prefill_energy_joules: float = 0.0
     total_decode_energy_joules: float = 0.0
+    # Per-rail totals. `total_ane_energy_joules` is what makes an ANE-resident
+    # backend (Apple Foundation Models) legible here at all -- on the GPU rail
+    # alone it looks like it did no work.
+    total_ane_energy_joules: float = 0.0
+    total_soc_energy_joules: float = 0.0
     avg_mean_itl_ms: float = 0.0
     avg_median_itl_ms: float = 0.0
     avg_p95_itl_ms: float = 0.0
@@ -77,6 +87,11 @@ class AggregatedStats:
     avg_throughput_per_watt: float = 0.0
     total_prefill_energy_joules: float = 0.0
     total_decode_energy_joules: float = 0.0
+    # Per-rail totals. `total_ane_energy_joules` is what makes an ANE-resident
+    # backend (Apple Foundation Models) legible here at all -- on the GPU rail
+    # alone it looks like it did no work.
+    total_ane_energy_joules: float = 0.0
+    total_soc_energy_joules: float = 0.0
     avg_mean_itl_ms: float = 0.0
     avg_median_itl_ms: float = 0.0
     avg_p95_itl_ms: float = 0.0
@@ -90,14 +105,27 @@ class TelemetryAggregator:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.row_factory = sqlite3.Row
 
-    @staticmethod
     def _time_filter(
+        self,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        current_methodology_only: bool = False,
     ) -> tuple[str, list[Any]]:
-        """Build a WHERE clause fragment for time-range filtering."""
+        """Build a WHERE clause fragment for time + methodology filtering.
+
+        ``current_methodology_only`` is opt-in (default False) because the
+        local dashboard still wants to render historical aggregates that
+        predate the per-record version stamp. The leaderboard ingest path
+        in ``server/routes.savings`` flips it to True so legacy rows (the
+        ones with NULL token_counting_version) don't pollute the public
+        per-token efficiency metric — they were the dominant source of
+        the bimodal Wh/token distribution.
+        """
         clauses: list[str] = []
         params: list[Any] = []
         if since is not None:
@@ -106,6 +134,11 @@ class TelemetryAggregator:
         if until is not None:
             clauses.append("timestamp <= ?")
             params.append(until)
+        if current_methodology_only and self._safe_col("token_counting_version"):
+            from openjarvis.core.types import TOKEN_COUNTING_VERSION
+
+            clauses.append("token_counting_version = ?")
+            params.append(TOKEN_COUNTING_VERSION)
         if clauses:
             return " WHERE " + " AND ".join(clauses), params
         return "", params
@@ -124,8 +157,11 @@ class TelemetryAggregator:
         *,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        current_methodology_only: bool = False,
     ) -> List[ModelStats]:
-        where, params = self._time_filter(since, until)
+        where, params = self._time_filter(
+            since, until, current_methodology_only=current_methodology_only
+        )
 
         # Build optional columns for new fields (graceful on old DBs)
         extra_cols = ""
@@ -134,6 +170,7 @@ class TelemetryAggregator:
         has_derived = self._safe_col("energy_per_output_token_joules")
         has_phase = self._safe_col("prefill_energy_joules")
         has_itl = self._safe_col("mean_itl_ms")
+        has_rails = self._safe_col("ane_energy_joules")
 
         if has_pte:
             extra_cols += ", SUM(prompt_tokens_evaluated) AS prompt_tokens_evaluated"
@@ -155,6 +192,11 @@ class TelemetryAggregator:
                 ", AVG(mean_itl_ms) AS avg_mean_itl_ms"
                 ", AVG(median_itl_ms) AS avg_median_itl_ms"
                 ", AVG(p95_itl_ms) AS avg_p95_itl_ms"
+            )
+        if has_rails:
+            extra_cols += (
+                ", SUM(ane_energy_joules) AS total_ane_energy_joules"
+                ", SUM(soc_energy_joules) AS total_soc_energy_joules"
             )
 
         sql = (
@@ -207,6 +249,9 @@ class TelemetryAggregator:
                 ms.avg_mean_itl_ms = r["avg_mean_itl_ms"] or 0.0
                 ms.avg_median_itl_ms = r["avg_median_itl_ms"] or 0.0
                 ms.avg_p95_itl_ms = r["avg_p95_itl_ms"] or 0.0
+            if has_rails:
+                ms.total_ane_energy_joules = r["total_ane_energy_joules"] or 0.0
+                ms.total_soc_energy_joules = r["total_soc_energy_joules"] or 0.0
             result.append(ms)
         return result
 
@@ -215,14 +260,18 @@ class TelemetryAggregator:
         *,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        current_methodology_only: bool = False,
     ) -> List[EngineStats]:
-        where, params = self._time_filter(since, until)
+        where, params = self._time_filter(
+            since, until, current_methodology_only=current_methodology_only
+        )
 
         extra_cols = ""
         has_tpj = self._safe_col("tokens_per_joule")
         has_derived = self._safe_col("energy_per_output_token_joules")
         has_phase = self._safe_col("prefill_energy_joules")
         has_itl = self._safe_col("mean_itl_ms")
+        has_rails = self._safe_col("ane_energy_joules")
 
         if has_tpj:
             extra_cols += ", AVG(tokens_per_joule) AS avg_tokens_per_joule"
@@ -242,6 +291,11 @@ class TelemetryAggregator:
                 ", AVG(mean_itl_ms) AS avg_mean_itl_ms"
                 ", AVG(median_itl_ms) AS avg_median_itl_ms"
                 ", AVG(p95_itl_ms) AS avg_p95_itl_ms"
+            )
+        if has_rails:
+            extra_cols += (
+                ", SUM(ane_energy_joules) AS total_ane_energy_joules"
+                ", SUM(soc_energy_joules) AS total_soc_energy_joules"
             )
 
         sql = (
@@ -288,6 +342,9 @@ class TelemetryAggregator:
                 es.avg_mean_itl_ms = r["avg_mean_itl_ms"] or 0.0
                 es.avg_median_itl_ms = r["avg_median_itl_ms"] or 0.0
                 es.avg_p95_itl_ms = r["avg_p95_itl_ms"] or 0.0
+            if has_rails:
+                es.total_ane_energy_joules = r["total_ane_energy_joules"] or 0.0
+                es.total_soc_energy_joules = r["total_soc_energy_joules"] or 0.0
             result.append(es)
         return result
 
@@ -305,9 +362,14 @@ class TelemetryAggregator:
         *,
         since: Optional[float] = None,
         until: Optional[float] = None,
+        current_methodology_only: bool = False,
     ) -> AggregatedStats:
-        model_stats = self.per_model_stats(since=since, until=until)
-        engine_stats = self.per_engine_stats(since=since, until=until)
+        model_stats = self.per_model_stats(
+            since=since, until=until, current_methodology_only=current_methodology_only
+        )
+        engine_stats = self.per_engine_stats(
+            since=since, until=until, current_methodology_only=current_methodology_only
+        )
         total_calls = sum(m.call_count for m in model_stats)
 
         def _weighted_avg(attr: str) -> float:
@@ -335,6 +397,8 @@ class TelemetryAggregator:
             total_decode_energy_joules=sum(
                 m.total_decode_energy_joules for m in model_stats
             ),
+            total_ane_energy_joules=sum(m.total_ane_energy_joules for m in model_stats),
+            total_soc_energy_joules=sum(m.total_soc_energy_joules for m in model_stats),
             avg_mean_itl_ms=_weighted_avg("avg_mean_itl_ms"),
             avg_median_itl_ms=_weighted_avg("avg_median_itl_ms"),
             avg_p95_itl_ms=_weighted_avg("avg_p95_itl_ms"),

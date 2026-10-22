@@ -16,6 +16,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from openjarvis.connectors.embeddings import default_embedder
 from openjarvis.connectors.pipeline import IngestionPipeline
 from openjarvis.connectors.store import KnowledgeStore
 from openjarvis.connectors.sync_engine import SyncEngine
@@ -260,7 +261,7 @@ def ingest_sources(
 
     Returns total chunks indexed across all sources.
     """
-    pipeline = IngestionPipeline(store)
+    pipeline = IngestionPipeline(store, embedder=default_embedder())
     engine = SyncEngine(pipeline, state_db=state_db)
     total = 0
     for src in sources:
@@ -279,7 +280,10 @@ def _launch_chat(store: KnowledgeStore, console: Console) -> None:
     """Start an interactive Deep Research chat session."""
     from openjarvis.agents.deep_research import DeepResearchAgent
     from openjarvis.connectors.retriever import TwoStageRetriever
+    from openjarvis.core.config import load_config
+    from openjarvis.core.events import EventBus
     from openjarvis.engine.ollama import OllamaEngine
+    from openjarvis.security import setup_security
     from openjarvis.tools.knowledge_search import KnowledgeSearchTool
     from openjarvis.tools.knowledge_sql import KnowledgeSQLTool
     from openjarvis.tools.scan_chunks import ScanChunksTool
@@ -288,7 +292,10 @@ def _launch_chat(store: KnowledgeStore, console: Console) -> None:
     console.print("\n[bold]Setting up Deep Research agent...[/bold]")
 
     # Engine
-    engine = OllamaEngine()
+    config = load_config()
+    bus = EventBus(record_history=False)
+    security = setup_security(config, OllamaEngine(), bus)
+    engine = security.engine
     if not engine.health():
         console.print(
             "[red]Ollama is not running.[/red] Start it with: [bold]ollama serve[/bold]"
@@ -321,6 +328,10 @@ def _launch_chat(store: KnowledgeStore, console: Console) -> None:
         model=_OLLAMA_MODEL,
         tools=tools,
         interactive=True,
+        bus=bus,
+        capability_policy=security.capability_policy,
+        rate_limiter=security.rate_limiter,
+        agent_id="cli:deep-research",
     )
 
     console.print(
@@ -413,6 +424,14 @@ def deep_research_setup(obsidian_vault: Optional[str], skip_chat: bool) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = KnowledgeStore(str(db_path))
 
+    embedder = default_embedder()
+    if embedder is None:
+        console.print(
+            "[yellow]No embedding model reachable — indexing lexical-only "
+            "(BM25). Run `ollama pull nomic-embed-text` and re-run to enable "
+            "hybrid search.[/yellow]"
+        )
+
     console.print("\n[bold]Ingesting...[/bold]")
     for src in all_sources:
         try:
@@ -420,7 +439,7 @@ def deep_research_setup(obsidian_vault: Optional[str], skip_chat: bool) -> None:
                 src["connector_id"],
                 src["config"],
             )
-            pipeline = IngestionPipeline(store)
+            pipeline = IngestionPipeline(store, embedder=embedder)
             engine = SyncEngine(pipeline)
             chunks = engine.sync(connector)
             console.print(f"  {src['display_name']}: [green]{chunks} chunks[/green]")

@@ -26,6 +26,11 @@ class Document:
     """Universal schema for data from any connector.
 
     All connectors normalize their output to this format before ingestion.
+
+    v1 schema fields (``source_id``, ``participants_raw``, ``channel``) default
+    to empty so existing connectors compile without modification; new
+    connectors should populate them. The pipeline derives ``source_id`` from
+    ``doc_id`` by stripping the ``{source}:`` prefix when not set explicitly.
     """
 
     doc_id: str
@@ -40,6 +45,10 @@ class Document:
     url: Optional[str] = None
     attachments: List[Attachment] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # v1 schema additions: defaulted empty so legacy connectors keep working.
+    source_id: str = ""
+    participants_raw: List[str] = field(default_factory=list)
+    channel: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -65,6 +74,11 @@ class BaseConnector(ABC):
     connector_id: str
     display_name: str
     auth_type: str  # "oauth" | "local" | "bridge" | "filesystem"
+    indexed_sources: tuple[str, ...] = ()
+
+    def knowledge_sources(self) -> tuple[str, ...]:
+        """Return KnowledgeStore source values owned by this connector."""
+        return self.indexed_sources or (self.connector_id,)
 
     @abstractmethod
     def is_connected(self) -> bool:

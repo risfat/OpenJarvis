@@ -38,6 +38,16 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.weather  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.fx_macro  # noqa: F401
+except ImportError:
+    pass
+
+try:
     import openjarvis.tools.code_interpreter  # noqa: F401
 except ImportError:
     pass
@@ -73,6 +83,7 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.docker_shell_exec  # noqa: F401
     import openjarvis.tools.shell_exec  # noqa: F401
 except ImportError:
     pass
@@ -138,6 +149,37 @@ except ImportError:
 
 try:
     import openjarvis.tools.digest_collect  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.scan_chunks  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.knowledge_sql  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.apple_calendar  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.knowledge_search  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.browser  # noqa: F401
+    import openjarvis.tools.browser_axtree  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    import openjarvis.tools.proactive_tools  # noqa: F401
 except ImportError:
     pass
 

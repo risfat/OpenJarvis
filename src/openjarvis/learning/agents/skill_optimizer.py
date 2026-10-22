@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from openjarvis.core.paths import get_config_dir
 from openjarvis.core.types import Trace, TraceStep
 from openjarvis.skills.manager import SkillManager
 from openjarvis.skills.overlay import SkillOverlay, write_overlay
@@ -99,7 +100,7 @@ class SkillOptimizer:
                 pass
             if overlay_dir is None:
                 overlay_dir = Path(
-                    "~/.openjarvis/learning/skills/"
+                    str(get_config_dir() / "learning" / "skills")
                 ).expanduser()
         overlay_dir = Path(overlay_dir).expanduser()
 
@@ -219,15 +220,16 @@ class SkillOptimizer:
                 return list(self._traces[:limit])
 
         try:
-            updates = optimizer.optimize(_BucketStore(skill_traces)) or {}
+            optimization_result = optimizer.optimize(_BucketStore(skill_traces)) or {}
         except Exception as exc:
             LOGGER.warning(
                 "DSPyAgentOptimizer raised for '%s' (using empty output): %s",
                 skill_name,
                 exc,
             )
-            updates = {}
+            optimization_result = {}
 
+        updates = optimization_result.get("config_updates") or {}
         description = str(updates.get("system_prompt", "")) if updates else ""
         few_shot_raw = updates.get("few_shot_examples", []) if updates else []
         few_shot: List[Dict[str, str]] = []
